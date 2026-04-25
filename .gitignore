@@ -1,0 +1,44 @@
+# dependencies
+node_modules/
+
+# env files
+.env
+.env.*
+!.env.example
+!**/.env.example
+
+# build output
+.next/
+.expo/
+dist/
+web-build/
+coverage/
+test-results/
+
+# Expo / React Native
+expo-env.d.ts
+.kotlin/
+.metro-health-check*
+/apps/mobile/android
+/apps/mobile/ios
+
+# debug
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+
+# OS / editor
+.DS_Store
+.codex
+*.orig.*
+
+# certificates / signing files
+*.jks
+*.p8
+*.p12
+*.key
+*.pem
+*.mobileprovision
+
+# TypeScript
+*.tsbuildinfo

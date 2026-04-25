@@ -1,0 +1,21 @@
+{
+  "name": "aquapin-monorepo",
+  "private": true,
+  "scripts": {
+    "web:dev": "npm run dev -w apps/web",
+    "web:build": "npm run build -w apps/web",
+    "web:lint": "npm run lint -w apps/web",
+    "web:typecheck": "npm run typecheck -w apps/web",
+    "mobile:eas:build:android:preview": "npm run eas:build:android:preview -w apps/mobile",
+    "mobile:eas:build:android:production": "npm run eas:build:android:production -w apps/mobile",
+    "mobile:eas:build:ios:production": "npm run eas:build:ios:production -w apps/mobile",
+    "dfd:svg": "node docs/dfd/generate_svgs.js",
+    "dfd:lucidchart": "node docs/dfd/generate_lucidchart_mermaid.js",
+    "hipo:svg": "node docs/hipo/generate_svgs.js",
+    "usecase:svg": "node docs/hipo/generate_use_case_svg.js"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

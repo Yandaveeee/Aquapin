@@ -1,0 +1,56 @@
+{
+  "expo": {
+    "name": "AquaPin",
+    "slug": "aquapin-mobile",
+    "version": "1.0.0",
+    "scheme": "aquapin",
+    "newArchEnabled": false,
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.aquapin.mobile"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/icon.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "softwareKeyboardLayoutMode": "resize",
+      "package": "com.aquapin.mobile",
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyA1c1Gw2fRPp_bHw2_y_477IpVPzrCOqvg"
+        }
+      },
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow AquaPin to use your location to show ponds on the map."
+        }
+      ],
+      "expo-asset"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "dfc8f5ce-df7b-4450-86ec-60f743fb72da"
+      }
+    },
+    "owner": "yandaveeee"
+  }
+}
