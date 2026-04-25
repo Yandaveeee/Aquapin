@@ -1,38 +1,5 @@
 # AquaPin Field - Mobile App
 
-Offline-first mobile data collection app for aquaculture field staff.
-
-## Features
-
-### ✅ Step 7: Authentication & Protected Navigation
-- **AuthContext**: Supabase authentication with persistent sessions
-- **Protected Routes**: Automatic redirect to login when not authenticated
-- **Login Screen**: Sign in / Sign up flow with persistent sessions
-- **Tab Navigation**: Bottom tab bar with Map, Data, Reports, Sync, Profile
-
-### ✅ Step 8: Geospatial Map & Pin Creation
-- **Map Screen**: Interactive map with react-native-maps
-- **GPS Location**: Real-time user location with permission handling
-- **Pond Markers**: Display existing ponds as pins on the map
-- **Tap to Create**: Tap anywhere on map to place a new pond marker
-- **Drag to Adjust**: Drag markers to fine-tune pond location
-- **Pond Form**: Modal form to name and save pond with coordinates
-
-### ✅ Step 9: Syncing & Data Entry Workflows
-- **Offline Database**: WatermelonDB with SQLite for local storage
-- **Data Entry Screen**: Multiple entry types (mortality, harvest, feeding, water quality)
-- **Pond Selection**: Horizontal scrollable pond selector
-- **Sync Screen**: Network status monitoring, pending items count, manual sync button
-- **Auto-sync**: Automatic sync when connection restored
-
-### ✅ Step 10: AI Reports & E2E Verification
-- **AI Reports Screen**: Generate intelligent farm insights
-- **Edge Functions**:
-  - `ai-reports`: Analyzes farm data and generates recommendations
-  - `verify-data`: E2E data integrity verification
-- **Metrics Dashboard**: Mortality rate, harvest yield, efficiency scores
-- **Action Items**: Prioritized recommendations with severity levels
-
 ## Project Structure
 
 ```
