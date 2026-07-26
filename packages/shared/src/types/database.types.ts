@@ -13,24 +13,54 @@ export interface Database {
         Row: {
           id: string
           email: string
+          full_name: string | null
           role: 'admin' | 'field_staff'
           status: 'pending' | 'approved'
+          last_login_at: string | null
+          latest_latitude: number | null
+          latest_longitude: number | null
+          location_accuracy_m: number | null
+          location_label: string | null
+          municipality: string | null
+          barangay: string | null
+          region: string | null
+          location_updated_at: string | null
           created_at: string
           updated_at: string
         }
         Insert: {
           id: string
           email: string
+          full_name?: string | null
           role?: 'admin' | 'field_staff'
           status?: 'pending' | 'approved'
+          last_login_at?: string | null
+          latest_latitude?: number | null
+          latest_longitude?: number | null
+          location_accuracy_m?: number | null
+          location_label?: string | null
+          municipality?: string | null
+          barangay?: string | null
+          region?: string | null
+          location_updated_at?: string | null
           created_at?: string
           updated_at?: string
         }
         Update: {
           id?: string
           email?: string
+          full_name?: string | null
           role?: 'admin' | 'field_staff'
           status?: 'pending' | 'approved'
+          last_login_at?: string | null
+          latest_latitude?: number | null
+          latest_longitude?: number | null
+          location_accuracy_m?: number | null
+          location_label?: string | null
+          municipality?: string | null
+          barangay?: string | null
+          region?: string | null
+          location_updated_at?: string | null
           created_at?: string
           updated_at?: string
         }
@@ -276,6 +306,108 @@ export interface Database {
         }
         Relationships: []
       }
+      feed_inventory_items: {
+        Row: {
+          id: string
+          feed_brand: string
+          remaining_bags: number
+          threshold_bags: number
+          updated_by: string | null
+          created_at: string
+          updated_at: string
+        }
+        Insert: {
+          id?: string
+          feed_brand: string
+          remaining_bags?: number
+          threshold_bags?: number
+          updated_by?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Update: {
+          id?: string
+          feed_brand?: string
+          remaining_bags?: number
+          threshold_bags?: number
+          updated_by?: string | null
+          created_at?: string
+          updated_at?: string
+        }
+        Relationships: []
+      }
+      feed_logs: {
+        Row: {
+          id: string
+          pond_id: string | null
+          type: 'purchase' | 'consumption' | 'adjustment'
+          feed_brand: string
+          quantity_bags: number
+          notes: string | null
+          logged_by: string
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          pond_id?: string | null
+          type: 'purchase' | 'consumption' | 'adjustment'
+          feed_brand: string
+          quantity_bags: number
+          notes?: string | null
+          logged_by: string
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          pond_id?: string | null
+          type?: 'purchase' | 'consumption' | 'adjustment'
+          feed_brand?: string
+          quantity_bags?: number
+          notes?: string | null
+          logged_by?: string
+          created_at?: string
+        }
+        Relationships: []
+      }
+      stocking_plans: {
+        Row: {
+          id: string
+          pond_id: string
+          species: string
+          quantity: number
+          average_weight_g: number
+          planned_date: string
+          feed_budget_bags: number
+          planned_by: string
+          status: string
+          created_at: string
+        }
+        Insert: {
+          id?: string
+          pond_id: string
+          species: string
+          quantity: number
+          average_weight_g?: number
+          planned_date: string
+          feed_budget_bags?: number
+          planned_by: string
+          status?: string
+          created_at?: string
+        }
+        Update: {
+          id?: string
+          pond_id?: string
+          species?: string
+          quantity?: number
+          average_weight_g?: number
+          planned_date?: string
+          feed_budget_bags?: number
+          planned_by?: string
+          status?: string
+          created_at?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
@@ -302,6 +434,22 @@ export interface Database {
           p_value: Json
         }
         Returns: Database['public']['Tables']['admin_settings']['Row']
+      }
+      record_staff_session: {
+        Args: Record<PropertyKey, never>
+        Returns: string
+      }
+      update_staff_location: {
+        Args: {
+          p_latitude: number
+          p_longitude: number
+          p_accuracy_m?: number | null
+          p_location_label?: string | null
+          p_municipality?: string | null
+          p_barangay?: string | null
+          p_region?: string | null
+        }
+        Returns: string
       }
     }
     Enums: {
