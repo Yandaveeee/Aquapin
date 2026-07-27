@@ -47,6 +47,7 @@ export default function LoginForm({ envLabel, nextPath, notice, version }: Login
       return;
     }
 
+    document.cookie = "aquapin_mock_admin=; path=/; max-age=0; SameSite=Lax";
     startTransition(() => {
       router.push(normalizeNextPath(nextPath));
       router.refresh();
