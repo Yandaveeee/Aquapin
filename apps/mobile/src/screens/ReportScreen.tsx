@@ -13,7 +13,7 @@ import {
   Alert,
   Dimensions,
 } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { usePonds } from '../hooks/useOfflineData';
 import { CONFIG } from '../config';
@@ -42,6 +42,7 @@ const WELCOME_MESSAGE: Message = {
 };
 
 export default function ReportScreen() {
+  const insets = useSafeAreaInsets();
   const [messages, setMessages] = useState<Message[]>([WELCOME_MESSAGE]);
   const [inputText, setInputText] = useState('');
   const [loading, setLoading] = useState(false);
@@ -270,7 +271,7 @@ export default function ReportScreen() {
               </View>
             )}
 
-            <View style={styles.inputWrapper}>
+            <View style={[styles.inputWrapper, { paddingBottom: keyboardVisible ? 6 : Math.max(12, insets.bottom + 8) }]}>
               <View style={styles.composer}>
                 <TextInput
                   style={styles.input}

@@ -17,12 +17,13 @@ import {
 } from 'react-native';
 import { useRoute, useNavigation } from '@react-navigation/native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import MapView, { Marker, Region, MapPressEvent, MapType, Polygon, Polyline, PROVIDER_GOOGLE } from 'react-native-maps';
+import MapView, { Marker, Region, MapPressEvent, MapType, Polygon, Polyline, UrlTile, PROVIDER_GOOGLE, PROVIDER_DEFAULT } from 'react-native-maps';
 import * as Location from 'expo-location';
 import { Ionicons } from '@expo/vector-icons';
 import { usePonds, useCreatePond } from '../hooks/useOfflineData';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
+import { LeafletMapView, LeafletMapViewRef } from '../components/LeafletMapView';
 
 // Types
 interface Coordinate {
@@ -45,18 +46,37 @@ interface MappedPond {
 }
 
 type MapMode = 'view' | 'point' | 'polygon';
+export type MapTileSource = 'osm' | 'google' | 'esri' | 'opentopo';
+
+interface MapOption {
+  label: string;
+  value: MapType;
+  tileSource: MapTileSource;
+}
 
 const MIN_BOTTOM_SHEET_SAFE_GAP = 28;
 const MODAL_TOP_SAFE_GAP = 24;
 const ANDROID_KEYBOARD_CLEARANCE = 8;
 const IOS_KEYBOARD_CLEARANCE = 8;
 
-const MAP_TYPES: { label: string; value: MapType }[] = [
-  { label: 'Standard', value: 'standard' },
-  { label: 'Satellite', value: 'satellite' },
-  { label: 'Hybrid', value: 'hybrid' },
-  { label: 'Terrain', value: 'terrain' },
+const MAP_OPTIONS: MapOption[] = [
+  { label: '🗺️ OpenStreetMap (Standard)', value: 'standard', tileSource: 'osm' },
+  { label: '🛰️ Satellite Imagery (Esri)', value: 'satellite', tileSource: 'esri' },
+  { label: '🏔️ Topographic / Terrain (OpenTopo)', value: 'terrain', tileSource: 'opentopo' },
+  { label: '📍 Google Maps (Standard)', value: 'standard', tileSource: 'google' },
+  { label: '🛰️ Google Maps (Satellite)', value: 'satellite', tileSource: 'google' },
+  { label: '🗺️ Google Maps (Hybrid)', value: 'hybrid', tileSource: 'google' },
 ];
+
+function getTileUrl(tileSource: MapTileSource, mapType: MapType): string {
+  if (tileSource === 'esri' || (tileSource === 'osm' && (mapType === 'satellite' || mapType === 'hybrid'))) {
+    return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+  }
+  if (tileSource === 'opentopo' || mapType === 'terrain') {
+    return 'https://tile.opentopomap.org/{z}/{x}/{y}.png';
+  }
+  return 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+}
 
 // Calculate polygon area using shoelace formula
 function calculatePolygonArea(coordinates: Coordinate[]): number {
@@ -134,7 +154,10 @@ export default function MapScreen() {
   const insets = useSafeAreaInsets();
   const route = useRoute<any>();
   const navigation = useNavigation<any>();
-  const mapProvider = Platform.OS === 'android' ? PROVIDER_GOOGLE : undefined;
+  const [tileSource, setTileSource] = useState<MapTileSource>('osm');
+  const [mapType, setMapType] = useState<MapType>('standard');
+  const activeProvider = tileSource === 'google' && Platform.OS === 'android' ? PROVIDER_GOOGLE : PROVIDER_DEFAULT;
+  const leafletRef = useRef<LeafletMapViewRef>(null);
   const mapRef = useRef<MapView | null>(null);
 
   const [region, setRegion] = useState<Region>({
@@ -151,7 +174,6 @@ export default function MapScreen() {
   const [loading, setLoading] = useState(false);
   const [locating, setLocating] = useState(false);
   const [mapReady, setMapReady] = useState(false);
-  const [mapType, setMapType] = useState<MapType>('standard');
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const { ponds } = usePonds();
   const createPond = useCreatePond();
@@ -181,7 +203,7 @@ export default function MapScreen() {
 
   const focusRegion = useCallback((nextRegion: Region, animated = true) => {
     setRegion(nextRegion);
-
+    leafletRef.current?.flyTo(nextRegion.latitude, nextRegion.longitude, 16);
     if (animated) {
       mapRef.current?.animateToRegion(nextRegion, 600);
     }
@@ -222,8 +244,14 @@ export default function MapScreen() {
   }, [mappedPonds.length]);
 
   const fitToMarkedPonds = useCallback((animated = true) => {
-    if (mappedCoordinates.length === 0 || !mapRef.current) {
+    if (mappedCoordinates.length === 0) {
       return false;
+    }
+
+    leafletRef.current?.fitBounds(mappedCoordinates);
+
+    if (!mapRef.current) {
+      return true;
     }
 
     if (mappedCoordinates.length === 1) {
@@ -290,29 +318,32 @@ export default function MapScreen() {
     let cancelled = false;
 
     (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        Alert.alert('Permission Denied', 'Location permission is needed to show your position on the map.');
-        return;
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          return;
+        }
+
+        const location = await Location.getCurrentPositionAsync({});
+        if (cancelled) {
+          return;
+        }
+
+        void persistLatestLocation(location);
+
+        if (hasMappedPondsRef.current) {
+          return;
+        }
+
+        focusRegion({
+          latitude: location.coords.latitude,
+          longitude: location.coords.longitude,
+          latitudeDelta: 0.0045,
+          longitudeDelta: 0.0045,
+        });
+      } catch (error) {
+        console.warn('Location initialization failed:', error);
       }
-
-      const location = await Location.getCurrentPositionAsync({});
-      if (cancelled) {
-        return;
-      }
-
-      void persistLatestLocation(location);
-
-      if (hasMappedPondsRef.current) {
-        return;
-      }
-
-      focusRegion({
-        latitude: location.coords.latitude,
-        longitude: location.coords.longitude,
-        latitudeDelta: 0.0045,
-        longitudeDelta: 0.0045,
-      });
     })();
 
     return () => {
@@ -435,23 +466,28 @@ export default function MapScreen() {
     if (Platform.OS === 'ios') {
       ActionSheetIOS.showActionSheetWithOptions(
         {
-          options: [...MAP_TYPES.map(t => t.label), 'Cancel'],
-          cancelButtonIndex: MAP_TYPES.length,
+          options: [...MAP_OPTIONS.map(t => t.label), 'Cancel'],
+          cancelButtonIndex: MAP_OPTIONS.length,
         },
         (buttonIndex) => {
-          if (buttonIndex < MAP_TYPES.length) {
-            setMapType(MAP_TYPES[buttonIndex].value);
+          if (buttonIndex < MAP_OPTIONS.length) {
+            const selected = MAP_OPTIONS[buttonIndex];
+            setMapType(selected.value);
+            setTileSource(selected.tileSource);
           }
         }
       );
     } else {
       Alert.alert(
-        'Map Type',
-        'Select map view',
+        'Map View / Layer',
+        'Select map provider & tile style',
         [
-          ...MAP_TYPES.map((type) => ({
-            text: type.label,
-            onPress: () => setMapType(type.value),
+          ...MAP_OPTIONS.map((opt) => ({
+            text: opt.label,
+            onPress: () => {
+              setMapType(opt.value);
+              setTileSource(opt.tileSource);
+            },
           })),
           { text: 'Cancel', style: 'cancel' },
         ]
@@ -531,21 +567,38 @@ export default function MapScreen() {
 
   return (
     <View style={styles.container}>
-      <MapView
-        ref={mapRef}
-        style={styles.map}
-        initialRegion={region}
-        onRegionChangeComplete={setRegion}
-        onPress={handleMapPress}
-        showsUserLocation
-        showsMyLocationButton={false}
-        provider={mapProvider}
-        mapType={mapType}
-        onMapReady={() => setMapReady(true)}
-      >
-        {/* Existing pond markers and polygons */}
-        {mappedPonds.map((pond) => {
-          return (
+      {tileSource !== 'google' ? (
+        <LeafletMapView
+          ref={leafletRef}
+          initialRegion={region}
+          mappedPonds={mappedPonds}
+          selectedLocation={selectedLocation}
+          polygonPoints={polygonPoints}
+          mapMode={mapMode}
+          tileSource={tileSource as any}
+          onMapPress={(coord) => {
+            if (mapMode === 'point') {
+              setSelectedLocation(coord);
+            } else if (mapMode === 'polygon') {
+              setPolygonPoints((prev) => [...prev, coord]);
+            }
+          }}
+          style={styles.map}
+        />
+      ) : (
+        <MapView
+          ref={mapRef}
+          style={styles.map}
+          initialRegion={region}
+          onRegionChangeComplete={setRegion}
+          onPress={handleMapPress}
+          showsUserLocation
+          showsMyLocationButton={false}
+          provider={activeProvider}
+          mapType={mapType}
+          onMapReady={() => setMapReady(true)}
+        >
+          {mappedPonds.map((pond) => (
             <React.Fragment key={pond.id}>
               {pond.boundary.length >= 3 && (
                 <Polygon
@@ -562,53 +615,32 @@ export default function MapScreen() {
                 pinColor={pond.isActive ? '#007bff' : '#16a34a'}
               />
             </React.Fragment>
-          );
-        })}
+          ))}
 
-        {/* Single point selection */}
-        {selectedLocation && mapMode === 'point' && (
-          <Marker
-            coordinate={selectedLocation}
-            pinColor="#28a745"
-            draggable
-            onDragEnd={(e) => setSelectedLocation(e.nativeEvent.coordinate)}
-          />
-        )}
+          {selectedLocation && mapMode === 'point' && (
+            <Marker
+              coordinate={selectedLocation}
+              pinColor="#28a745"
+              draggable
+              onDragEnd={(e) => setSelectedLocation(e.nativeEvent.coordinate)}
+            />
+          )}
 
-        {/* Polygon drawing */}
-        {polygonPoints.length > 0 && (
-          <>
-            {/* Points */}
-            {polygonPoints.map((point, index) => (
-              <Marker
-                key={index}
-                coordinate={point}
-                pinColor="#16a34a"
-                title={`Point ${index + 1}`}
-              />
-            ))}
-
-            {/* Lines connecting points with bolder styling */}
-            {polygonPoints.length > 1 && (
-              <Polyline
-                coordinates={polygonPoints}
-                strokeColor="#16a34a"
-                strokeWidth={4}
-              />
-            )}
-
-            {/* Closed polygon preview - show fill even with 2 points as a preview */}
-            {polygonPoints.length >= 2 && (
-              <Polygon
-                coordinates={polygonPoints}
-                fillColor="rgba(34, 197, 94, 0.35)"
-                strokeColor="#16a34a"
-                strokeWidth={3}
-              />
-            )}
-          </>
-        )}
-      </MapView>
+          {polygonPoints.length > 0 && (
+            <>
+              {polygonPoints.map((point, index) => (
+                <Marker key={index} coordinate={point} pinColor="#16a34a" title={`Point ${index + 1}`} />
+              ))}
+              {polygonPoints.length > 1 && (
+                <Polyline coordinates={polygonPoints} strokeColor="#16a34a" strokeWidth={4} />
+              )}
+              {polygonPoints.length >= 2 && (
+                <Polygon coordinates={polygonPoints} fillColor="rgba(34, 197, 94, 0.35)" strokeColor="#16a34a" strokeWidth={3} />
+              )}
+            </>
+          )}
+        </MapView>
+      )}
 
       {/* Header overlay */}
       <SafeAreaView style={styles.headerContainer} edges={['top', 'left', 'right']}>
@@ -645,7 +677,7 @@ export default function MapScreen() {
         <View style={styles.mapInfoRow}>
           <View style={styles.mapTypeLabel}>
             <Text style={styles.mapTypeText}>
-              {MAP_TYPES.find(t => t.value === mapType)?.label}
+              {MAP_OPTIONS.find(t => t.value === mapType && t.tileSource === tileSource)?.label || 'OpenStreetMap'}
             </Text>
           </View>
           <TouchableOpacity

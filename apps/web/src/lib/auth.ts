@@ -1,3 +1,4 @@
+import { cache } from "react";
 import type { Database } from "@aquapin/shared";
 import type { User } from "@supabase/supabase-js";
 import { redirect } from "next/navigation";
@@ -5,7 +6,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 
 type PublicProfile = Database["public"]["Tables"]["public_profiles"]["Row"];
 
-export async function getCurrentUserAndProfile(): Promise<{
+export const getCurrentUserAndProfile = cache(async function getCurrentUserAndProfile(): Promise<{
   user: User | null;
   profile: PublicProfile | null;
 }> {
@@ -64,9 +65,9 @@ export async function getCurrentUserAndProfile(): Promise<{
     user,
     profile,
   };
-}
+});
 
-export async function requireApprovedAdmin(): Promise<{
+export const requireApprovedAdmin = cache(async function requireApprovedAdmin(): Promise<{
   user: User;
   profile: PublicProfile;
 }> {
@@ -87,4 +88,4 @@ export async function requireApprovedAdmin(): Promise<{
     user: user as User,
     profile: profile as PublicProfile,
   };
-}
+});

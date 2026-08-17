@@ -45,6 +45,8 @@ const publicExtra = publicEnvKeys.reduce((acc, key) => {
   return acc;
 }, {});
 
+const mapsApiKey = process.env.EXPO_PUBLIC_MAPS_API_KEY || expo.android?.config?.googleMaps?.apiKey || '';
+
 module.exports = {
   ...expo,
   extra: {
@@ -58,6 +60,12 @@ module.exports = {
   },
   android: {
     ...expo.android,
+    config: {
+      ...(expo.android?.config || {}),
+      googleMaps: {
+        apiKey: mapsApiKey,
+      },
+    },
     adaptiveIcon: {
       ...expo.android.adaptiveIcon,
       foregroundImage: './apps/mobile/assets/android-icon-foreground.png',
@@ -70,3 +78,4 @@ module.exports = {
     favicon: './apps/mobile/assets/favicon.png',
   },
 };
+

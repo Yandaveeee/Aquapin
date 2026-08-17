@@ -9,11 +9,14 @@ node_modules/
 
 # build output
 .next/
+.next-dev/
 .expo/
 dist/
 web-build/
 coverage/
 test-results/
+*.apk
+.worktrees/
 
 # Expo / React Native
 expo-env.d.ts

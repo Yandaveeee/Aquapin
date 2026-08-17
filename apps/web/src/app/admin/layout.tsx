@@ -3,7 +3,7 @@ import AdminShell from "@/components/admin/AdminShell";
 import { getAdminShellData } from "@/lib/admin-data";
 import { requireApprovedAdmin } from "@/lib/auth";
 
-export const dynamic = "force-dynamic";
+export const revalidate = 15;
 
 export default async function AdminLayout({ children }: { children: ReactNode }) {
   const { profile } = await requireApprovedAdmin();

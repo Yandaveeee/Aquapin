@@ -13,6 +13,7 @@ import {
   Platform,
   useWindowDimensions,
 } from 'react-native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import {
@@ -26,11 +27,12 @@ import {
 } from '../hooks/useOfflineData';
 import { useAuth } from '../contexts/AuthContext';
 import { parsePondSpeciesLabel } from '../db/pondState';
+import { aquapinColors, aquapinRadius } from '../theme/aquapin';
 
 const ENTRY_TYPES = [
-  { id: 'mortality', label: 'Mortality', icon: 'skull', color: '#dc3545', unit: 'fish' },
-  { id: 'harvest', label: 'Harvest', icon: 'basket', color: '#28a745', unit: 'kg' },
-  { id: 'stocking', label: 'Stocking', icon: 'add-circle', color: '#20c997', unit: 'fingerlings' },
+  { id: 'mortality', label: 'Mortality', icon: 'skull', color: aquapinColors.red, unit: 'fish' },
+  { id: 'harvest', label: 'Harvest', icon: 'basket', color: aquapinColors.blue, unit: 'kg' },
+  { id: 'stocking', label: 'Stocking', icon: 'add-circle', color: aquapinColors.green, unit: 'fingerlings' },
 ] as const;
 
 type EntryType = (typeof ENTRY_TYPES)[number]['id'];
@@ -220,6 +222,14 @@ export default function DataEntryScreen() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
   const scrollViewRef = useRef<ScrollView>(null);
+  const route = useRoute<any>();
+  const navigation = useNavigation<any>();
+  const isHistoryOnlyMode = route.params?.historyOnly === true;
+
+  const initialTypeParam = route.params?.initialType as EntryType | undefined;
+  const initialFilterTypeParam = route.params?.initialFilterType as EntryType | 'all' | undefined;
+  const activeModuleType = initialTypeParam || initialFilterTypeParam;
+  const isSpecificModule = activeModuleType === 'stocking' || activeModuleType === 'harvest' || activeModuleType === 'mortality';
 
   const [activeSegment, setActiveSegment] = useState<DataSegment>('log');
 
@@ -258,6 +268,32 @@ export default function DataEntryScreen() {
 
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const focusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const initialType = route.params?.initialType as EntryType | undefined;
+    const initialSegment = route.params?.initialSegment as DataSegment | undefined;
+    const initialFilterType = route.params?.initialFilterType as EntryType | 'all' | undefined;
+
+    if (initialType && ENTRY_TYPES.some((item) => item.id === initialType)) {
+      setSelectedType(initialType);
+    }
+
+    if (initialSegment && SEGMENTS.some((item) => item.id === initialSegment)) {
+      setActiveSegment(initialSegment);
+    }
+
+    if (route.params?.historyOnly === true) {
+      setActiveSegment('recent');
+    }
+
+    if (
+      initialFilterType &&
+      (initialFilterType === 'all' || ENTRY_TYPES.some((item) => item.id === initialFilterType))
+    ) {
+      setFilterType(initialFilterType);
+    }
+  }, [route.params?.historyOnly, route.params?.initialFilterType, route.params?.initialType, route.params?.initialSegment, route.params?.requestKey]);
+
   const [fieldLayouts, setFieldLayouts] = useState<Record<string, number>>({});
 
   const { ponds } = usePonds();
@@ -746,16 +782,17 @@ export default function DataEntryScreen() {
 
   const composerBottom = useMemo(() => {
     if (keyboardHeight > 0) {
-      return Math.max(2, keyboardHeight - insets.bottom - 6);
+      return Math.max(8, keyboardHeight + 8);
     }
-    return 6;
+    return Math.max(16, insets.bottom + 16);
   }, [insets.bottom, keyboardHeight]);
 
   const contentBottomPadding = useMemo(() => {
-    if (activeSegment !== 'log') return 28;
-    if (keyboardHeight <= 0) return 188;
-    return 188 + Math.max(0, keyboardHeight - 64);
-  }, [activeSegment, keyboardHeight]);
+    if (activeSegment !== 'log') return 28 + insets.bottom;
+    const basePadding = 188 + insets.bottom;
+    if (keyboardHeight <= 0) return basePadding;
+    return basePadding + Math.max(0, keyboardHeight - 64);
+  }, [activeSegment, keyboardHeight, insets.bottom]);
 
   const hasFormData = Boolean(quantity || notes || species || averageWeight || source || fishCount);
 
@@ -767,6 +804,32 @@ export default function DataEntryScreen() {
   const typeFilterLabel = TYPE_FILTER_OPTIONS.find((item) => item.id === filterType)?.label || 'All Types';
   const dateFilterLabel = DATE_OPTIONS.find((item) => item.id === filterDate)?.label || 'Any Date';
   const statusFilterLabel = statusOptions.find((item) => item.id === filterStatus)?.label || 'Any Status';
+  const visibleSegment = isHistoryOnlyMode ? 'recent' : activeSegment;
+  const activeSegmentMeta = isHistoryOnlyMode
+    ? { id: 'recent' as DataSegment, label: 'History', icon: 'time-outline' }
+    : SEGMENTS.find((item) => item.id === activeSegment) || SEGMENTS[0];
+  const workspaceBadgeLabel = visibleSegment === 'log' ? currentType.label : typeFilterLabel;
+  const workspaceTitle =
+    isHistoryOnlyMode
+      ? `${typeFilterLabel} History`
+      : activeSegment === 'log'
+      ? `${currentType.label} Workflow`
+      : activeSegment === 'queue'
+        ? 'Sync Queue Monitor'
+        : `${activeSegmentMeta.label} Records`;
+  const workspaceSubtitle =
+    isHistoryOnlyMode
+      ? 'Recent record history for the selected module.'
+      : activeSegment === 'log'
+      ? 'Create new pond records with the upgraded Aquapin 2.0 capture flow.'
+      : activeSegment === 'recent'
+        ? 'Review filtered record entries with the same updated Aquapin workspace style.'
+        : activeSegment === 'history'
+          ? 'Trace pond changes and lifecycle history in the upgraded records module.'
+          : 'Track pending offline entries, failed sync items, and queue health in one view.';
+  const workspacePondLabel = selectedPond ? String((selectedPond as any).name || 'Selected pond') : pondFilterLabel;
+  const workspaceAccentColor =
+    visibleSegment === 'queue' ? aquapinColors.blue : filterType !== 'all' || visibleSegment === 'log' ? currentType.color : aquapinColors.blue;
 
   const renderSkeletonList = (count: number) => (
     <View>
@@ -842,10 +905,11 @@ export default function DataEntryScreen() {
     >
       <View style={styles.modalOverlay}>
         <View style={styles.modalContent}>
+          <View style={styles.modalHandle} />
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>Select Pond</Text>
             <TouchableOpacity onPress={() => setShowPondSelector(false)}>
-              <Ionicons name="close" size={24} color="#667085" />
+              <Ionicons name="close" size={22} color={aquapinColors.textMuted} />
             </TouchableOpacity>
           </View>
 
@@ -912,12 +976,13 @@ export default function DataEntryScreen() {
     >
       <View style={styles.modalOverlay}>
         <View style={styles.modalContent}>
+          <View style={styles.modalHandle} />
           <View style={styles.modalHeader}>
             <Text style={styles.modalTitle}>
               {selectedType === 'harvest' ? 'Select Harvest Species' : 'Select Species'}
             </Text>
             <TouchableOpacity onPress={() => setShowSpeciesSelector(false)}>
-              <Ionicons name="close" size={24} color="#667085" />
+              <Ionicons name="close" size={22} color={aquapinColors.textMuted} />
             </TouchableOpacity>
           </View>
 
@@ -953,48 +1018,50 @@ export default function DataEntryScreen() {
   );
 
   const renderCompactFilters = () => (
-    <ScrollView
-      horizontal
-      showsHorizontalScrollIndicator={false}
-      contentContainerStyle={styles.filterRow}
-      keyboardShouldPersistTaps="handled"
-    >
-      <TouchableOpacity
-        style={styles.filterChip}
-        onPress={() => setFilterPondId((prev) => cycleNext(prev, pondFilterOptions))}
+    <View style={styles.filterShell}>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.filterRow}
+        keyboardShouldPersistTaps="handled"
       >
-        <Ionicons name="water-outline" size={14} color="#0b6cd4" />
-        <Text style={styles.filterChipLabel}>Pond</Text>
-        <Text style={styles.filterChipValue} numberOfLines={1}>{pondFilterLabel}</Text>
-      </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.filterChip}
+          onPress={() => setFilterPondId((prev) => cycleNext(prev, pondFilterOptions))}
+        >
+          <Ionicons name="water-outline" size={15} color={aquapinColors.blue} />
+          <Text style={styles.filterChipLabel}>Pond</Text>
+          <Text style={styles.filterChipValue} numberOfLines={1}>{pondFilterLabel}</Text>
+        </TouchableOpacity>
 
-      <TouchableOpacity
-        style={styles.filterChip}
-        onPress={() => setFilterType((prev) => cycleNext(prev, TYPE_FILTER_OPTIONS.map((item) => item.id)))}
-      >
-        <Ionicons name="funnel-outline" size={14} color="#7e22ce" />
-        <Text style={styles.filterChipLabel}>Type</Text>
-        <Text style={styles.filterChipValue} numberOfLines={1}>{typeFilterLabel}</Text>
-      </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.filterChip}
+          onPress={() => setFilterType((prev) => cycleNext(prev, TYPE_FILTER_OPTIONS.map((item) => item.id)))}
+        >
+          <Ionicons name="funnel-outline" size={15} color={aquapinColors.green} />
+          <Text style={styles.filterChipLabel}>Type</Text>
+          <Text style={styles.filterChipValue} numberOfLines={1}>{typeFilterLabel}</Text>
+        </TouchableOpacity>
 
-      <TouchableOpacity
-        style={styles.filterChip}
-        onPress={() => setFilterDate((prev) => cycleNext(prev, DATE_OPTIONS.map((item) => item.id)))}
-      >
-        <Ionicons name="calendar-outline" size={14} color="#0369a1" />
-        <Text style={styles.filterChipLabel}>Date</Text>
-        <Text style={styles.filterChipValue} numberOfLines={1}>{dateFilterLabel}</Text>
-      </TouchableOpacity>
+        <TouchableOpacity
+          style={styles.filterChip}
+          onPress={() => setFilterDate((prev) => cycleNext(prev, DATE_OPTIONS.map((item) => item.id)))}
+        >
+          <Ionicons name="calendar-outline" size={15} color={aquapinColors.blue} />
+          <Text style={styles.filterChipLabel}>Date</Text>
+          <Text style={styles.filterChipValue} numberOfLines={1}>{dateFilterLabel}</Text>
+        </TouchableOpacity>
 
-      <TouchableOpacity
-        style={styles.filterChip}
-        onPress={() => setFilterStatus((prev) => cycleNext(prev, statusCycleValues))}
-      >
-        <Ionicons name="checkbox-outline" size={14} color="#0f766e" />
-        <Text style={styles.filterChipLabel}>Status</Text>
-        <Text style={styles.filterChipValue} numberOfLines={1}>{statusFilterLabel}</Text>
-      </TouchableOpacity>
-    </ScrollView>
+        <TouchableOpacity
+          style={styles.filterChip}
+          onPress={() => setFilterStatus((prev) => cycleNext(prev, statusCycleValues))}
+        >
+          <Ionicons name="checkbox-outline" size={15} color={aquapinColors.amber} />
+          <Text style={styles.filterChipLabel}>Status</Text>
+          <Text style={styles.filterChipValue} numberOfLines={1}>{statusFilterLabel}</Text>
+        </TouchableOpacity>
+      </ScrollView>
+    </View>
   );
 
   const rowCardWidth = Math.max(240, width - 32);
@@ -1076,32 +1143,34 @@ export default function DataEntryScreen() {
 
   const renderLogSegment = () => (
     <View>
-      <View style={styles.section}>
-        <Text style={styles.sectionTitle}>Report Type</Text>
-        <View style={styles.typeGrid}>
-          {ENTRY_TYPES.map((type) => {
-            const isSelected = selectedType === type.id;
-            return (
-              <TouchableOpacity
-                key={type.id}
-                style={[
-                  styles.typeButton,
-                  isSelected && {
-                    backgroundColor: `${type.color}14`,
-                    borderColor: type.color,
-                  },
-                ]}
-                onPress={() => setSelectedType(type.id)}
-              >
-                <View style={[styles.typeIconContainer, isSelected && { backgroundColor: `${type.color}25` }]}>
-                  <Ionicons name={type.icon as any} size={20} color={isSelected ? type.color : '#667085'} />
-                </View>
-                <Text style={[styles.typeLabel, isSelected && { color: type.color, fontWeight: '700' }]}>{type.label}</Text>
-              </TouchableOpacity>
-            );
-          })}
+      {!isSpecificModule && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Report Type</Text>
+          <View style={styles.typeGrid}>
+            {ENTRY_TYPES.map((type) => {
+              const isSelected = selectedType === type.id;
+              return (
+                <TouchableOpacity
+                  key={type.id}
+                  style={[
+                    styles.typeButton,
+                    isSelected && {
+                      backgroundColor: `${type.color}14`,
+                      borderColor: type.color,
+                    },
+                  ]}
+                  onPress={() => setSelectedType(type.id)}
+                >
+                  <View style={[styles.typeIconContainer, isSelected && { backgroundColor: `${type.color}25` }]}>
+                    <Ionicons name={type.icon as any} size={20} color={isSelected ? type.color : '#667085'} />
+                  </View>
+                  <Text style={[styles.typeLabel, isSelected && { color: type.color, fontWeight: '700' }]}>{type.label}</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
         </View>
-      </View>
+      )}
 
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>Pond</Text>
@@ -1486,34 +1555,40 @@ export default function DataEntryScreen() {
       )}
 
       <View style={styles.header}>
-        <View>
-          <Text style={styles.title}>Data</Text>
-          <Text style={styles.subtitle}>Record and track pond operations</Text>
-        </View>
-        <View style={styles.dateBadge}>
-          <Ionicons name="calendar-outline" size={13} color="#0b6cd4" />
-          <Text style={styles.dateBadgeText}>{formatBadgeDate(new Date())}</Text>
+        <TouchableOpacity style={styles.backButton} activeOpacity={0.9} onPress={() => navigation.goBack()}>
+          <Ionicons name="chevron-back" size={22} color={aquapinColors.text} />
+        </TouchableOpacity>
+        <View style={styles.headerCopy}>
+          <Text style={styles.eyebrow}>Aquapin 2.0</Text>
+          <Text style={styles.title}>{isHistoryOnlyMode ? 'Record History' : 'Records Workspace'}</Text>
+          <Text style={styles.subtitle}>
+            {isHistoryOnlyMode
+              ? 'Filtered recent history for the selected records module.'
+              : 'Capture, review, and sync pond records in the upgraded Aquapin interface.'}
+          </Text>
         </View>
       </View>
 
-      <View style={styles.segmentBar}>
-        {SEGMENTS.map((segment) => {
-          const active = activeSegment === segment.id;
-          return (
-            <TouchableOpacity
-              key={segment.id}
-              style={[styles.segmentButton, active && styles.segmentButtonActive]}
-              onPress={() => {
-                setActiveSegment(segment.id);
-                setFilterStatus('all');
-              }}
-            >
-              <Ionicons name={segment.icon as any} size={14} color={active ? '#0b6cd4' : '#667085'} />
-              <Text style={[styles.segmentButtonText, active && styles.segmentButtonTextActive]}>{segment.label}</Text>
-            </TouchableOpacity>
-          );
-        })}
-      </View>
+      {!isHistoryOnlyMode && (
+        <View style={styles.segmentBar}>
+          {SEGMENTS.map((segment) => {
+            const active = activeSegment === segment.id;
+            return (
+              <TouchableOpacity
+                key={segment.id}
+                style={[styles.segmentButton, active && styles.segmentButtonActive]}
+                onPress={() => {
+                  setActiveSegment(segment.id);
+                  setFilterStatus('all');
+                }}
+              >
+                <Ionicons name={segment.icon as any} size={14} color={active ? '#0b6cd4' : '#667085'} />
+                <Text style={[styles.segmentButtonText, active && styles.segmentButtonTextActive]}>{segment.label}</Text>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
 
       <ScrollView
         ref={scrollViewRef}
@@ -1522,13 +1597,56 @@ export default function DataEntryScreen() {
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
-        {activeSegment === 'log' && renderLogSegment()}
-        {activeSegment === 'recent' && renderRecentSegment()}
-        {activeSegment === 'history' && renderHistorySegment()}
-        {activeSegment === 'queue' && renderQueueSegment()}
+        <View style={styles.heroCard}>
+          <View style={styles.heroTopRow}>
+            <View style={[styles.heroBadge, { backgroundColor: `${workspaceAccentColor}18` }]}>
+              <Ionicons
+                name={(visibleSegment === 'queue' ? 'cloud-upload-outline' : currentType.icon) as any}
+                size={16}
+                color={workspaceAccentColor}
+              />
+              <Text
+                style={[
+                  styles.heroBadgeText,
+                  { color: workspaceAccentColor },
+                ]}
+              >
+                {workspaceBadgeLabel}
+              </Text>
+            </View>
+
+            <View style={styles.heroPill}>
+              <Ionicons name={activeSegmentMeta.icon as any} size={14} color={aquapinColors.blue} />
+              <Text style={styles.heroPillText}>{activeSegmentMeta.label}</Text>
+            </View>
+          </View>
+
+          <Text style={styles.heroTitle}>{workspaceTitle}</Text>
+          <Text style={styles.heroSubtitle}>{workspaceSubtitle}</Text>
+
+          <View style={styles.heroStatsRow}>
+            <View style={styles.heroStatCard}>
+              <Text style={styles.heroStatLabel}>Pond</Text>
+              <Text style={styles.heroStatValue} numberOfLines={1}>{workspacePondLabel}</Text>
+            </View>
+            <View style={styles.heroStatCard}>
+              <Text style={styles.heroStatLabel}>{isHistoryOnlyMode ? 'Records' : 'Pending'}</Text>
+              <Text style={styles.heroStatValue}>{isHistoryOnlyMode ? filteredRecentEntries.length : queuePendingCount}</Text>
+            </View>
+            <View style={styles.heroStatCard}>
+              <Text style={styles.heroStatLabel}>Date</Text>
+              <Text style={styles.heroStatValue}>{formatBadgeDate(new Date())}</Text>
+            </View>
+          </View>
+        </View>
+
+        {visibleSegment === 'log' && renderLogSegment()}
+        {visibleSegment === 'recent' && renderRecentSegment()}
+        {visibleSegment === 'history' && renderHistorySegment()}
+        {visibleSegment === 'queue' && renderQueueSegment()}
       </ScrollView>
 
-      {activeSegment === 'log' && (
+      {visibleSegment === 'log' && (
         <View style={[styles.stickyComposer, { bottom: composerBottom }]}>
           <TouchableOpacity
             style={[
@@ -1576,7 +1694,7 @@ export default function DataEntryScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#f6f8fb',
+    backgroundColor: aquapinColors.background,
   },
   toast: {
     position: 'absolute',
@@ -1590,20 +1708,20 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    shadowColor: '#000',
+    shadowColor: '#16335c',
     shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.18,
+    shadowOpacity: 0.14,
     shadowRadius: 8,
     elevation: 6,
   },
   toastSuccess: {
-    backgroundColor: '#17803d',
+    backgroundColor: aquapinColors.green,
   },
   toastError: {
-    backgroundColor: '#c92a2a',
+    backgroundColor: aquapinColors.red,
   },
   toastInfo: {
-    backgroundColor: '#0b6cd4',
+    backgroundColor: aquapinColors.blue,
   },
   toastText: {
     color: '#fff',
@@ -1612,252 +1730,365 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   header: {
-    paddingHorizontal: 16,
-    paddingTop: 6,
-    paddingBottom: 10,
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    paddingBottom: 14,
     flexDirection: 'row',
     justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 12,
+  },
+  backButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 16,
+    backgroundColor: aquapinColors.surface,
+    borderWidth: 1,
+    borderColor: aquapinColors.border,
     alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerCopy: {
+    flex: 1,
+  },
+  eyebrow: {
+    color: aquapinColors.green,
+    fontSize: 12,
+    fontWeight: '800',
+    textTransform: 'uppercase',
   },
   title: {
-    fontSize: 25,
-    fontWeight: '800',
-    color: '#111827',
+    fontSize: 28,
+    fontWeight: '900',
+    color: aquapinColors.text,
+    marginTop: 6,
   },
   subtitle: {
-    marginTop: 2,
+    marginTop: 6,
     fontSize: 13,
-    color: '#667085',
+    lineHeight: 20,
+    color: aquapinColors.textMuted,
+    maxWidth: 280,
   },
   dateBadge: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    backgroundColor: '#e6f2ff',
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    borderWidth: 1,
+    borderColor: aquapinColors.border,
   },
   dateBadgeText: {
-    color: '#0b6cd4',
+    color: aquapinColors.blue,
     fontSize: 12,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   segmentBar: {
     flexDirection: 'row',
     gap: 8,
-    paddingHorizontal: 16,
-    paddingBottom: 8,
+    marginHorizontal: 16,
+    marginBottom: 8,
+    padding: 8,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: aquapinRadius.sheet,
+    shadowColor: '#16335c',
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
   },
   segmentButton: {
     flex: 1,
-    minHeight: 36,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#d5dbe3',
-    backgroundColor: '#fff',
+    minHeight: 42,
+    borderRadius: 18,
+    backgroundColor: aquapinColors.surfaceMuted,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
-    paddingHorizontal: 6,
+    gap: 6,
+    paddingHorizontal: 8,
   },
   segmentButtonActive: {
-    borderColor: '#8cc2ff',
-    backgroundColor: '#eaf4ff',
+    backgroundColor: aquapinColors.blueSoft,
   },
   segmentButtonText: {
     fontSize: 11,
-    color: '#667085',
-    fontWeight: '600',
+    color: aquapinColors.textMuted,
+    fontWeight: '700',
   },
   segmentButtonTextActive: {
-    color: '#0b6cd4',
-    fontWeight: '700',
+    color: aquapinColors.blue,
   },
   scrollView: {
     flex: 1,
   },
+  heroCard: {
+    backgroundColor: aquapinColors.surface,
+    borderRadius: aquapinRadius.sheet,
+    padding: 20,
+    marginBottom: 18,
+    shadowColor: '#16335c',
+    shadowOpacity: 0.1,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 5,
+  },
+  heroTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  heroBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  heroBadgeText: {
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  heroPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: aquapinColors.blueSoft,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  heroPillText: {
+    color: aquapinColors.blue,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  heroTitle: {
+    fontSize: 23,
+    fontWeight: '900',
+    color: aquapinColors.text,
+    marginTop: 16,
+  },
+  heroSubtitle: {
+    marginTop: 6,
+    fontSize: 13,
+    lineHeight: 20,
+    color: aquapinColors.textMuted,
+  },
+  heroStatsRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 18,
+  },
+  heroStatCard: {
+    flex: 1,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 22,
+    paddingHorizontal: 14,
+    paddingVertical: 16,
+  },
+  heroStatLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: aquapinColors.textMuted,
+    textTransform: 'uppercase',
+  },
+  heroStatValue: {
+    marginTop: 8,
+    fontSize: 13,
+    fontWeight: '800',
+    color: aquapinColors.text,
+  },
   section: {
     marginBottom: 18,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: aquapinRadius.sheet,
+    padding: 18,
+    shadowColor: '#16335c',
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
   },
   sectionTitle: {
     fontSize: 12,
-    fontWeight: '700',
-    color: '#667085',
+    fontWeight: '800',
+    color: aquapinColors.textMuted,
     textTransform: 'uppercase',
-    marginBottom: 10,
+    marginBottom: 12,
     letterSpacing: 0.4,
   },
   typeGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
+    gap: 10,
   },
   typeButton: {
     width: '31.8%',
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: aquapinColors.border,
     alignItems: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 6,
+    paddingVertical: 14,
+    paddingHorizontal: 8,
   },
   typeIconContainer: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#f2f4f7',
-    marginBottom: 6,
+    backgroundColor: '#edf4fb',
+    marginBottom: 8,
   },
   typeLabel: {
-    fontSize: 10,
-    color: '#667085',
+    fontSize: 11,
+    color: aquapinColors.textMuted,
     textAlign: 'center',
-    fontWeight: '600',
+    fontWeight: '700',
   },
   pondSelectorCard: {
-    backgroundColor: '#fff',
-    borderRadius: 14,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 24,
     borderWidth: 1,
-    borderStyle: 'dashed',
-    borderColor: '#d0d8e2',
-    padding: 14,
+    borderColor: aquapinColors.border,
+    padding: 16,
     flexDirection: 'row',
     alignItems: 'center',
   },
   selectedPondIcon: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#eaf4ff',
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: aquapinColors.blueSoft,
     alignItems: 'center',
     justifyContent: 'center',
   },
   selectPondIcon: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    backgroundColor: '#eff6ff',
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: aquapinColors.greenSoft,
     alignItems: 'center',
     justifyContent: 'center',
   },
   selectedPondInfo: {
     flex: 1,
-    marginLeft: 10,
+    marginLeft: 12,
   },
   selectedPondName: {
     fontSize: 15,
-    color: '#1f2937',
-    fontWeight: '700',
+    color: aquapinColors.text,
+    fontWeight: '800',
   },
   selectedPondLocation: {
-    marginTop: 2,
+    marginTop: 4,
     fontSize: 12,
-    color: '#667085',
+    color: aquapinColors.textMuted,
   },
   selectPondText: {
     flex: 1,
-    marginLeft: 10,
+    marginLeft: 12,
     fontSize: 14,
-    color: '#0b6cd4',
-    fontWeight: '600',
+    color: aquapinColors.blue,
+    fontWeight: '800',
   },
   emptyPonds: {
-    backgroundColor: '#fff',
-    borderRadius: 14,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 24,
     borderWidth: 1,
-    borderColor: '#e2e8f0',
+    borderColor: aquapinColors.border,
     paddingVertical: 26,
     alignItems: 'center',
   },
   emptyText: {
     marginTop: 8,
     fontSize: 14,
-    color: '#667085',
-    fontWeight: '600',
+    color: aquapinColors.textMuted,
+    fontWeight: '700',
   },
   emptySubtext: {
     marginTop: 2,
     fontSize: 12,
-    color: '#98a2b3',
+    color: aquapinColors.textMuted,
   },
   pondStatusCard: {
     marginTop: 10,
-    backgroundColor: '#fff',
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    padding: 12,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 24,
+    padding: 16,
   },
   statusHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 8,
+    marginBottom: 10,
   },
   statusBadge: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
     gap: 4,
   },
   statusActive: {
-    backgroundColor: '#dbfce7',
+    backgroundColor: aquapinColors.greenSoft,
   },
   statusInactive: {
-    backgroundColor: '#edf2f7',
+    backgroundColor: aquapinColors.surface,
   },
   statusText: {
     fontSize: 11,
-    fontWeight: '700',
+    fontWeight: '800',
     textTransform: 'uppercase',
   },
   statusActiveText: {
-    color: '#17803d',
+    color: aquapinColors.green,
   },
   statusInactiveText: {
-    color: '#667085',
+    color: aquapinColors.textMuted,
   },
   historyButton: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    backgroundColor: '#eaf4ff',
-    borderRadius: 999,
-    paddingHorizontal: 9,
-    paddingVertical: 5,
+    backgroundColor: aquapinColors.blueSoft,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
   },
   historyButtonText: {
     fontSize: 11,
-    color: '#0b6cd4',
-    fontWeight: '700',
+    color: aquapinColors.blue,
+    fontWeight: '800',
   },
   stockInfo: {
-    gap: 6,
+    gap: 8,
   },
   stockRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
+    gap: 8,
   },
   speciesText: {
     fontSize: 13,
-    color: '#1f2937',
-    fontWeight: '600',
+    color: aquapinColors.text,
+    fontWeight: '700',
   },
   countText: {
     fontSize: 12,
-    color: '#475467',
+    color: aquapinColors.textMuted,
   },
   inactiveHint: {
     fontSize: 12,
-    color: '#667085',
+    color: aquapinColors.textMuted,
   },
   readinessRow: {
     flexDirection: 'row',
@@ -1865,31 +2096,31 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   readinessChip: {
-    borderRadius: 999,
-    paddingHorizontal: 9,
-    paddingVertical: 5,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
   },
   readinessChipDone: {
-    backgroundColor: '#dbfce7',
+    backgroundColor: aquapinColors.greenSoft,
   },
   readinessChipPending: {
-    backgroundColor: '#edf2f7',
+    backgroundColor: aquapinColors.surfaceMuted,
   },
   readinessText: {
     fontSize: 11,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   readinessTextDone: {
-    color: '#17803d',
+    color: aquapinColors.green,
   },
   readinessTextPending: {
-    color: '#667085',
+    color: aquapinColors.textMuted,
   },
   inputGroup: {
-    marginBottom: 14,
+    marginBottom: 16,
   },
   labelRow: {
     flexDirection: 'row',
@@ -1898,71 +2129,71 @@ const styles = StyleSheet.create({
   },
   label: {
     fontSize: 13,
-    color: '#1f2937',
-    fontWeight: '700',
-    marginBottom: 7,
+    color: aquapinColors.text,
+    fontWeight: '800',
+    marginBottom: 8,
   },
   optionalLabel: {
     fontSize: 11,
-    color: '#98a2b3',
+    color: aquapinColors.textMuted,
   },
   input: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 18,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
-    paddingHorizontal: 12,
-    paddingVertical: 12,
-    color: '#1f2937',
+    borderColor: aquapinColors.border,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+    color: aquapinColors.text,
     fontSize: 15,
   },
   textArea: {
-    minHeight: 90,
+    minHeight: 96,
   },
   quickAddContainer: {
-    marginTop: 8,
+    marginTop: 10,
     flexDirection: 'row',
     gap: 8,
   },
   quickAddButton: {
-    backgroundColor: '#edf5ff',
-    borderColor: '#c9ddfb',
+    backgroundColor: aquapinColors.greenSoft,
+    borderColor: '#d5efc7',
     borderWidth: 1,
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 13,
+    paddingVertical: 7,
   },
   quickAddText: {
-    color: '#0b6cd4',
+    color: aquapinColors.green,
     fontSize: 12,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   speciesSelector: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 18,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
-    paddingHorizontal: 12,
-    paddingVertical: 12,
+    borderColor: aquapinColors.border,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
   },
   speciesSelectorDisabled: {
-    backgroundColor: '#f8fafc',
+    backgroundColor: '#f5f8fc',
   },
   speciesSelectorText: {
     flex: 1,
-    color: '#1f2937',
+    color: aquapinColors.text,
     fontSize: 14,
   },
   speciesPlaceholder: {
-    color: '#98a2b3',
+    color: aquapinColors.textMuted,
   },
   fieldHint: {
     marginTop: 6,
     fontSize: 12,
-    color: '#667085',
+    color: aquapinColors.textMuted,
   },
   harvestTypeContainer: {
     flexDirection: 'row',
@@ -1970,140 +2201,162 @@ const styles = StyleSheet.create({
   },
   harvestTypeButton: {
     flex: 1,
-    borderRadius: 10,
+    borderRadius: 18,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
-    backgroundColor: '#f8fafc',
+    borderColor: aquapinColors.border,
+    backgroundColor: aquapinColors.surfaceMuted,
     alignItems: 'center',
-    paddingVertical: 10,
+    paddingVertical: 12,
   },
   harvestTypeButtonActive: {
-    backgroundColor: '#17803d',
-    borderColor: '#17803d',
+    backgroundColor: aquapinColors.green,
+    borderColor: aquapinColors.green,
   },
   harvestTypeText: {
-    color: '#667085',
+    color: aquapinColors.textMuted,
     fontSize: 13,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   harvestTypeTextActive: {
     color: '#fff',
   },
+  filterShell: {
+    backgroundColor: aquapinColors.surface,
+    borderRadius: aquapinRadius.sheet,
+    paddingVertical: 8,
+    marginBottom: 16,
+    shadowColor: '#16335c',
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
+  },
   filterRow: {
     gap: 8,
-    paddingBottom: 12,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
   },
   filterChip: {
     minWidth: 118,
     maxWidth: 170,
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surfaceMuted,
+    borderRadius: 20,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
-    paddingVertical: 8,
-    paddingHorizontal: 10,
+    borderColor: aquapinColors.border,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
     gap: 1,
   },
   filterChipLabel: {
     fontSize: 10,
-    color: '#98a2b3',
-    fontWeight: '700',
+    color: aquapinColors.textMuted,
+    fontWeight: '800',
     textTransform: 'uppercase',
   },
   filterChipValue: {
     fontSize: 12,
-    color: '#1f2937',
-    fontWeight: '600',
+    color: aquapinColors.text,
+    fontWeight: '700',
   },
   groupSection: {
-    marginBottom: 14,
+    marginBottom: 16,
   },
   groupHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 8,
+    marginBottom: 10,
+    paddingHorizontal: 4,
   },
   groupTitle: {
     fontSize: 13,
-    fontWeight: '800',
-    color: '#344054',
+    fontWeight: '900',
+    color: aquapinColors.text,
   },
   groupCountWrap: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
   },
   groupCountText: {
     fontSize: 12,
-    color: '#667085',
-    fontWeight: '600',
+    color: aquapinColors.textMuted,
+    fontWeight: '700',
   },
   swipeRowContainer: {
-    marginBottom: 8,
+    marginBottom: 10,
   },
   entryCard: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
+    borderColor: aquapinColors.border,
     borderLeftWidth: 4,
-    paddingVertical: 10,
-    paddingHorizontal: 10,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
     flexDirection: 'row',
     alignItems: 'center',
+    shadowColor: '#16335c',
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 3,
   },
   entryIconWrap: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
   },
   entryInfo: {
     flex: 1,
-    marginLeft: 9,
+    marginLeft: 12,
   },
   entryTypeText: {
     fontSize: 13,
-    color: '#1f2937',
-    fontWeight: '700',
+    color: aquapinColors.text,
+    fontWeight: '800',
   },
   entrySubText: {
-    marginTop: 1,
+    marginTop: 2,
     fontSize: 12,
-    color: '#475467',
+    color: aquapinColors.textMuted,
   },
   entryTimeText: {
-    marginTop: 2,
+    marginTop: 4,
     fontSize: 11,
-    color: '#98a2b3',
+    color: aquapinColors.textMuted,
   },
   entryStatusWrap: {
     marginLeft: 6,
   },
   statusPill: {
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
+    borderRadius: aquapinRadius.pill,
+    paddingHorizontal: 9,
+    paddingVertical: 5,
   },
   statusQueued: {
-    backgroundColor: '#fff7cc',
+    backgroundColor: aquapinColors.amberSoft,
   },
   statusSynced: {
-    backgroundColor: '#def7e4',
+    backgroundColor: aquapinColors.greenSoft,
   },
   statusFailed: {
-    backgroundColor: '#fde1e1',
+    backgroundColor: aquapinColors.redSoft,
   },
   statusQueuedText: {
-    color: '#a16207',
+    color: aquapinColors.amber,
   },
   statusSyncedText: {
-    color: '#137333',
+    color: aquapinColors.green,
   },
   statusFailedText: {
-    color: '#b42318',
+    color: aquapinColors.red,
   },
   statusPillText: {
     fontSize: 10,
@@ -2114,9 +2367,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'stretch',
     marginLeft: 8,
-    borderRadius: 12,
+    borderRadius: 22,
     overflow: 'hidden',
-    height: 54,
+    height: 68,
     alignSelf: 'center',
   },
   swipeActionButton: {
@@ -2126,13 +2379,13 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   editAction: {
-    backgroundColor: '#0b6cd4',
+    backgroundColor: aquapinColors.blue,
   },
   duplicateAction: {
-    backgroundColor: '#7e22ce',
+    backgroundColor: aquapinColors.teal,
   },
   deleteAction: {
-    backgroundColor: '#c92a2a',
+    backgroundColor: aquapinColors.red,
   },
   swipeActionText: {
     color: '#fff',
@@ -2140,161 +2393,178 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   historyCard: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
+    borderColor: aquapinColors.border,
     borderLeftWidth: 4,
-    marginBottom: 8,
-    padding: 10,
+    marginBottom: 10,
+    padding: 14,
     flexDirection: 'row',
     alignItems: 'center',
+    shadowColor: '#16335c',
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 3,
   },
   historyIconContainer: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
   },
   historyInfo: {
     flex: 1,
-    marginLeft: 9,
+    marginLeft: 12,
   },
   historyTitle: {
     fontSize: 13,
-    color: '#1f2937',
-    fontWeight: '700',
+    color: aquapinColors.text,
+    fontWeight: '800',
   },
   historySubtitle: {
-    marginTop: 2,
+    marginTop: 3,
     fontSize: 12,
-    color: '#475467',
+    color: aquapinColors.textMuted,
   },
   historyDate: {
-    marginTop: 2,
+    marginTop: 4,
     fontSize: 11,
-    color: '#98a2b3',
+    color: aquapinColors.textMuted,
   },
   statusPillMiniText: {
     fontSize: 10,
-    color: '#344054',
-    fontWeight: '700',
+    color: aquapinColors.text,
+    fontWeight: '800',
     textTransform: 'uppercase',
   },
   statusActiveLite: {
-    backgroundColor: '#dbfce7',
+    backgroundColor: aquapinColors.greenSoft,
   },
   statusHarvestedLite: {
-    backgroundColor: '#f2f4f7',
+    backgroundColor: aquapinColors.surfaceMuted,
   },
   statusLoggedLite: {
-    backgroundColor: '#eaf4ff',
+    backgroundColor: aquapinColors.blueSoft,
   },
   queueSummaryCard: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: aquapinRadius.sheet,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
-    padding: 12,
-    marginBottom: 12,
+    borderColor: aquapinColors.border,
+    padding: 18,
+    marginBottom: 14,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 10,
+    shadowColor: '#16335c',
+    shadowOpacity: 0.08,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
   },
   queueSummaryTitle: {
-    fontSize: 14,
-    color: '#1f2937',
-    fontWeight: '800',
+    fontSize: 16,
+    color: aquapinColors.text,
+    fontWeight: '900',
   },
   queueSummarySub: {
-    marginTop: 2,
-    fontSize: 11,
-    color: '#667085',
+    marginTop: 4,
+    fontSize: 12,
+    color: aquapinColors.textMuted,
     fontWeight: '600',
   },
   queueSyncButton: {
-    borderRadius: 10,
-    backgroundColor: '#0b6cd4',
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-    minWidth: 90,
+    borderRadius: 18,
+    backgroundColor: aquapinColors.blue,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    minWidth: 102,
     alignItems: 'center',
   },
   queueSyncButtonText: {
     color: '#fff',
     fontSize: 12,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   skeletonCard: {
-    backgroundColor: '#fff',
-    borderRadius: 12,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 22,
     borderWidth: 1,
-    borderColor: '#e8edf3',
-    padding: 10,
-    marginBottom: 8,
+    borderColor: '#e3ecf5',
+    padding: 14,
+    marginBottom: 10,
     flexDirection: 'row',
     alignItems: 'center',
   },
   skeletonAvatar: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#edf2f7',
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: aquapinColors.surfaceMuted,
   },
   skeletonTextWrap: {
     flex: 1,
-    marginLeft: 10,
+    marginLeft: 12,
     gap: 6,
   },
   skeletonLineShort: {
     width: '36%',
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#edf2f7',
+    backgroundColor: aquapinColors.surfaceMuted,
   },
   skeletonLineLong: {
     width: '76%',
     height: 8,
     borderRadius: 4,
-    backgroundColor: '#edf2f7',
+    backgroundColor: aquapinColors.surfaceMuted,
   },
   stickyComposer: {
     position: 'absolute',
-    left: 0,
-    right: 0,
+    left: 10,
+    right: 10,
     backgroundColor: 'rgba(255,255,255,0.98)',
-    borderTopWidth: 1,
-    borderTopColor: '#dde3ea',
-    paddingTop: 8,
-    paddingHorizontal: 10,
+    borderRadius: 28,
+    borderWidth: 1,
+    borderColor: aquapinColors.border,
+    paddingTop: 10,
+    paddingBottom: 10,
+    paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
+    shadowColor: '#16335c',
+    shadowOpacity: 0.14,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 8,
   },
   saveButton: {
     flex: 1,
-    borderRadius: 10,
-    minHeight: 42,
+    borderRadius: 18,
+    minHeight: 48,
     alignItems: 'center',
     justifyContent: 'center',
   },
   saveButtonSecondary: {
-    backgroundColor: '#edf5ff',
+    backgroundColor: aquapinColors.blueSoft,
     borderWidth: 1,
-    borderColor: '#bfd8ff',
+    borderColor: '#cfe1fb',
     flex: 0.7,
   },
   saveButtonText: {
     color: '#fff',
     fontSize: 13,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   saveButtonSecondaryText: {
-    color: '#0b6cd4',
+    color: aquapinColors.blue,
     fontSize: 13,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   saveButtonDisabled: {
     opacity: 0.45,
@@ -2303,120 +2573,129 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    paddingHorizontal: 9,
-    paddingVertical: 8,
-    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 16,
     borderWidth: 1,
-    borderColor: '#d0d8e2',
-    backgroundColor: '#f8fafc',
+    borderColor: aquapinColors.border,
+    backgroundColor: aquapinColors.surfaceMuted,
   },
   resetInlineText: {
-    color: '#475467',
+    color: aquapinColors.textMuted,
     fontSize: 11,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.45)',
+    backgroundColor: 'rgba(8, 18, 32, 0.34)',
     justifyContent: 'flex-end',
   },
   modalContent: {
-    backgroundColor: '#fff',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
+    backgroundColor: aquapinColors.surface,
+    borderTopLeftRadius: 30,
+    borderTopRightRadius: 30,
     maxHeight: '75%',
     minHeight: '52%',
+  },
+  modalHandle: {
+    width: 48,
+    height: 5,
+    borderRadius: 999,
+    backgroundColor: aquapinColors.border,
+    alignSelf: 'center',
+    marginTop: 12,
+    marginBottom: 6,
   },
   modalHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: 18,
     paddingVertical: 14,
     borderBottomWidth: 1,
-    borderBottomColor: '#eff3f7',
+    borderBottomColor: '#edf3f8',
   },
   modalTitle: {
     fontSize: 18,
-    fontWeight: '800',
-    color: '#1f2937',
+    fontWeight: '900',
+    color: aquapinColors.text,
   },
   searchContainer: {
-    margin: 12,
-    borderRadius: 10,
+    margin: 14,
+    borderRadius: 18,
     borderWidth: 1,
-    borderColor: '#dbe3ec',
-    backgroundColor: '#f8fafc',
-    paddingHorizontal: 10,
+    borderColor: aquapinColors.border,
+    backgroundColor: aquapinColors.surfaceMuted,
+    paddingHorizontal: 12,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
+    gap: 8,
   },
   searchInput: {
     flex: 1,
-    paddingVertical: 10,
-    color: '#1f2937',
+    paddingVertical: 12,
+    color: aquapinColors.text,
     fontSize: 14,
   },
   pondListItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 14,
-    paddingVertical: 11,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
     borderBottomWidth: 1,
-    borderBottomColor: '#f2f4f7',
+    borderBottomColor: '#edf3f8',
   },
   pondListItemSelected: {
-    backgroundColor: '#eff6ff',
+    backgroundColor: aquapinColors.blueSoft,
   },
   pondIconContainer: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: '#f2f4f7',
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: aquapinColors.surfaceMuted,
     alignItems: 'center',
     justifyContent: 'center',
   },
   pondIconContainerSelected: {
-    backgroundColor: '#e3f0ff',
+    backgroundColor: '#d9eaff',
   },
   pondInfo: {
     flex: 1,
-    marginLeft: 10,
+    marginLeft: 12,
   },
   pondListName: {
     fontSize: 14,
-    color: '#1f2937',
-    fontWeight: '700',
+    color: aquapinColors.text,
+    fontWeight: '800',
   },
   pondListNameSelected: {
-    color: '#0b6cd4',
+    color: aquapinColors.blue,
   },
   pondListLocation: {
-    marginTop: 2,
+    marginTop: 4,
     fontSize: 12,
-    color: '#667085',
+    color: aquapinColors.textMuted,
   },
   speciesItem: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
     borderBottomWidth: 1,
-    borderBottomColor: '#f2f4f7',
+    borderBottomColor: '#edf3f8',
   },
   speciesItemSelected: {
-    backgroundColor: '#ecfdf6',
+    backgroundColor: aquapinColors.greenSoft,
   },
   speciesListText: {
     flex: 1,
     fontSize: 14,
-    color: '#1f2937',
-    fontWeight: '600',
+    color: aquapinColors.text,
+    fontWeight: '700',
   },
   speciesListTextSelected: {
-    color: '#17803d',
+    color: aquapinColors.green,
   },
   emptyState: {
     alignItems: 'center',
@@ -2427,26 +2706,26 @@ const styles = StyleSheet.create({
   emptyStateText: {
     marginTop: 10,
     fontSize: 15,
-    color: '#667085',
-    fontWeight: '700',
+    color: aquapinColors.textMuted,
+    fontWeight: '800',
     textAlign: 'center',
   },
   emptyStateSubtext: {
     marginTop: 4,
     fontSize: 12,
-    color: '#98a2b3',
+    color: aquapinColors.textMuted,
     textAlign: 'center',
   },
   pickPondButton: {
     marginTop: 12,
-    borderRadius: 10,
-    backgroundColor: '#0b6cd4',
-    paddingHorizontal: 14,
-    paddingVertical: 9,
+    borderRadius: 18,
+    backgroundColor: aquapinColors.blue,
+    paddingHorizontal: 16,
+    paddingVertical: 11,
   },
   pickPondButtonText: {
     color: '#fff',
     fontSize: 12,
-    fontWeight: '700',
+    fontWeight: '800',
   },
 });

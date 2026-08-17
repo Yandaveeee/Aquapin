@@ -1,0 +1,861 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Animated, Easing, ScrollView, StyleSheet, Text, TouchableOpacity, View, Platform } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
+import { useNavigation } from '@react-navigation/native';
+import { useFarmOverview, useSync, usePonds } from '../../hooks';
+import MapView, { Marker, Polygon, UrlTile, PROVIDER_DEFAULT, PROVIDER_GOOGLE } from 'react-native-maps';
+import { LeafletMapView, MappedPond } from '../../components/LeafletMapView';
+import * as Location from 'expo-location';
+import {
+  aquapinColors,
+  formatCompactNumber,
+  formatCurrencyPhp,
+  formatPercent,
+  formatRelativeTime,
+  formatWholeNumber,
+} from '../../theme/aquapin';
+
+function parseLocation(location: string): { latitude: number; longitude: number } | null {
+  const parts = String(location || '').split(',').map((item) => parseFloat(item.trim()));
+  if (parts.length !== 2 || Number.isNaN(parts[0]) || Number.isNaN(parts[1])) return null;
+  return { latitude: parts[0], longitude: parts[1] };
+}
+
+type MarkerPoint = {
+  id: string;
+  name: string;
+  currentStockCount: number;
+  isActive: boolean;
+  top: number;
+  left: number;
+};
+
+function getActivityTone(type: 'stocking' | 'mortality' | 'harvest') {
+  switch (type) {
+    case 'stocking':
+      return { bg: aquapinColors.greenSoft, fg: aquapinColors.green, icon: 'add-circle-outline' as const };
+    case 'mortality':
+      return { bg: aquapinColors.redSoft, fg: aquapinColors.red, icon: 'warning-outline' as const };
+    case 'harvest':
+      return { bg: aquapinColors.blueSoft, fg: aquapinColors.blue, icon: 'basket-outline' as const };
+    default:
+      return { bg: aquapinColors.surfaceMuted, fg: aquapinColors.textMuted, icon: 'ellipse-outline' as const };
+  }
+}
+
+export default function DashboardScreen() {
+  const navigation = useNavigation<any>();
+  const overview = useFarmOverview();
+  const { queueSnapshot, lastSync } = useSync();
+  const [showAiIntro, setShowAiIntro] = useState(false);
+  const aiButtonScale = useRef(new Animated.Value(1)).current;
+  const aiBubbleOpacity = useRef(new Animated.Value(0)).current;
+  const aiBubbleScale = useRef(new Animated.Value(0.96)).current;
+
+  const { ponds } = usePonds();
+  const mapRef = useRef<MapView | null>(null);
+  const [mapReady, setMapReady] = useState(false);
+  const [scrollEnabled, setScrollEnabled] = useState(true);
+
+  const initialRegion = {
+    latitude: 14.5995,
+    longitude: 120.9842,
+    latitudeDelta: 0.009,
+    longitudeDelta: 0.009,
+  };
+
+  const mapProvider = PROVIDER_DEFAULT;
+
+  const centerOnMyLocation = async () => {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') return;
+
+      const location = await Location.getCurrentPositionAsync({});
+      mapRef.current?.animateToRegion({
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+        latitudeDelta: 0.004,
+        longitudeDelta: 0.004,
+      }, 600);
+    } catch (e) {
+      console.warn('Failed to get location:', e);
+    }
+  };
+
+  // Auto-fit all ponds within the visible screen once map is ready and ponds are loaded
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+
+    if (ponds.length === 0) {
+      centerOnMyLocation();
+      return;
+    }
+
+    const coords: { latitude: number; longitude: number }[] = [];
+    ponds.forEach((pond) => {
+      const center = parseLocation(pond.location);
+      if (center) {
+        coords.push(center);
+      }
+
+      const pondAny = pond as any;
+      if (pondAny.boundary) {
+        try {
+          const boundaryCoords = JSON.parse(pondAny.boundary);
+          if (Array.isArray(boundaryCoords)) {
+            boundaryCoords.forEach((coord) => {
+              if (typeof coord.latitude === 'number' && typeof coord.longitude === 'number') {
+                coords.push({ latitude: coord.latitude, longitude: coord.longitude });
+              }
+            });
+          }
+        } catch (e) {
+          // Ignore invalid boundary JSON
+        }
+      }
+    });
+
+    if (coords.length > 0) {
+      mapRef.current.fitToCoordinates(coords, {
+        edgePadding: { top: 40, right: 40, bottom: 40, left: 40 },
+        animated: true,
+      });
+    } else {
+      centerOnMyLocation();
+    }
+  }, [mapReady, ponds]);
+
+  const waterQualityScore = useMemo(() => {
+    if (overview.survivalRate === null) return 91;
+    const mortalityPenalty = overview.totalMortality > 0 ? Math.min(12, Math.round(overview.totalMortality / 250)) : 0;
+    return Math.max(74, Math.round(overview.survivalRate) - mortalityPenalty);
+  }, [overview.survivalRate, overview.totalMortality]);
+
+  const openStackScreen = (name: string, params?: Record<string, any>) => {
+    navigation.getParent()?.navigate(name, params);
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    setShowAiIntro(true);
+    aiButtonScale.setValue(0.96);
+    aiBubbleOpacity.setValue(0);
+    aiBubbleScale.setValue(0.96);
+
+    Animated.parallel([
+      Animated.sequence([
+        Animated.timing(aiButtonScale, {
+          toValue: 1.08,
+          duration: 260,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.spring(aiButtonScale, {
+          toValue: 1,
+          friction: 5,
+          tension: 90,
+          useNativeDriver: true,
+        }),
+      ]),
+      Animated.timing(aiBubbleOpacity, {
+        toValue: 1,
+        duration: 220,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+      Animated.timing(aiBubbleScale, {
+        toValue: 1,
+        duration: 220,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }),
+    ]).start();
+
+    const hideTimer = setTimeout(() => {
+      Animated.timing(aiBubbleOpacity, {
+        toValue: 0,
+        duration: 220,
+        easing: Easing.in(Easing.cubic),
+        useNativeDriver: true,
+      }).start(({ finished }) => {
+        if (finished && isMounted) {
+          setShowAiIntro(false);
+        }
+      });
+    }, 3000);
+
+    return () => {
+      isMounted = false;
+      clearTimeout(hideTimer);
+    };
+  }, [aiBubbleOpacity, aiBubbleScale, aiButtonScale]);
+
+  const moduleCards = [
+    {
+      key: 'ponds',
+      title: 'Pond Management',
+      subtitle: 'GPS mapping, polygon creation, and pond history.',
+      icon: 'map-outline' as const,
+      onPress: () => navigation.navigate('Ponds'),
+    },
+    {
+      key: 'records',
+      title: 'Records',
+      subtitle: 'Stocking, mortality, harvest, and queue review.',
+      icon: 'document-text-outline' as const,
+      onPress: () => navigation.navigate('Records'),
+    },
+    {
+      key: 'sync',
+      title: 'Sync Module',
+      subtitle: 'Offline queue monitoring and sync health.',
+      icon: 'cloud-upload-outline' as const,
+      onPress: () => openStackScreen('SyncStatus'),
+    },
+    {
+      key: 'ai',
+      title: 'AI Assistant',
+      subtitle: 'Recommendations, health signals, and growth tips.',
+      icon: 'sparkles-outline' as const,
+      onPress: () => openStackScreen('AiAssistant'),
+    },
+    {
+      key: 'profile',
+      title: 'Profile & Settings',
+      subtitle: 'Notifications, security, and account preferences.',
+      icon: 'settings-outline' as const,
+      onPress: () => navigation.navigate('Profile'),
+    },
+    {
+      key: 'map',
+      title: 'GPS Pond Map',
+      subtitle: 'Open live pond mapping and location capture.',
+      icon: 'navigate-outline' as const,
+      onPress: () => openStackScreen('PondMap', { requestKey: Date.now(), initialMode: 'view' }),
+    },
+  ];
+
+  const topActivity = overview.recentActivities[0];
+
+  return (
+    <SafeAreaView style={styles.safeArea} edges={['top', 'left', 'right']}>
+      <ScrollView
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.content}
+        scrollEnabled={scrollEnabled}
+      >
+        <View style={styles.headerRow}>
+          <View style={styles.aiEntryWrap}>
+            <Animated.View style={{ transform: [{ scale: aiButtonScale }] }}>
+              <TouchableOpacity
+                style={styles.iconButton}
+                activeOpacity={0.88}
+                accessibilityRole="button"
+                accessibilityLabel="AI Assistant"
+                onPress={() => openStackScreen('AiAssistant')}
+              >
+                <MaterialCommunityIcons name="robot-outline" size={23} color={aquapinColors.blue} />
+              </TouchableOpacity>
+            </Animated.View>
+            {showAiIntro ? (
+              <Animated.View
+                pointerEvents="none"
+                style={[
+                  styles.aiIntroBubble,
+                  {
+                    opacity: aiBubbleOpacity,
+                    transform: [{ scale: aiBubbleScale }],
+                  },
+                ]}
+              >
+                <Text style={styles.aiIntroText}>Introducing your AI Assistant</Text>
+              </Animated.View>
+            ) : null}
+          </View>
+          <View style={styles.brandBlock}>
+            <Text style={styles.brandTitle}>
+              Aqua<Text style={styles.brandTitleAccent}>pin</Text>
+            </Text>
+            <Text style={styles.brandSubtitle}>Aquapin Version 2.0</Text>
+          </View>
+          <TouchableOpacity style={styles.iconButton} onPress={() => openStackScreen('SyncStatus')}>
+            <Ionicons name="notifications-outline" size={22} color={aquapinColors.text} />
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.mapCard}>
+          <View style={styles.sectionHeadRow}>
+            <Text style={styles.sectionTitle}>Pond Map</Text>
+            <TouchableOpacity onPress={() => openStackScreen('PondMap', { requestKey: Date.now(), initialMode: 'view' })}>
+              <Text style={styles.linkText}>View All</Text>
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.mapCanvas}>
+            <LeafletMapView
+              initialRegion={initialRegion}
+              mappedPonds={ponds.map((pond: any) => {
+                const center = parseLocation(pond.location);
+                if (!center) return null;
+                let boundary: any[] = [];
+                if (pond.boundary) {
+                  try { boundary = JSON.parse(pond.boundary); } catch (e) {}
+                }
+                return {
+                  id: String(pond.id),
+                  name: pond.name || '',
+                  location: pond.location || '',
+                  center,
+                  boundary: Array.isArray(boundary) ? boundary : [],
+                  isActive: Boolean(pond.isActive),
+                };
+              }).filter((p): p is MappedPond => Boolean(p))}
+              tileSource="osm"
+              style={styles.map}
+            />
+
+            <View style={styles.mapInfoCard} pointerEvents="none">
+              <Text style={styles.mapInfoTitle}>{topActivity?.pondName || overview.pondPreview[0]?.name || 'Pond 01'}</Text>
+              <Text style={styles.mapInfoLine}>GPS Pond Map Active</Text>
+              <Text style={styles.mapInfoLine}>Stock: {formatWholeNumber(overview.totalStock)}</Text>
+              <Text style={styles.mapInfoLine}>Updated: {formatRelativeTime(overview.latestActivityAt)}</Text>
+            </View>
+
+            <TouchableOpacity
+              style={styles.locateButton}
+              onPress={centerOnMyLocation}
+            >
+              <Ionicons name="locate-outline" size={18} color={aquapinColors.text} />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.mapFooter}>
+            <View style={styles.dotsRow}>
+              {[0, 1, 2, 3].map((dot) => (
+                <View key={dot} style={[styles.dot, dot === 0 && styles.dotActive]} />
+              ))}
+            </View>
+            <View style={styles.mapFooterButtons}>
+              <TouchableOpacity style={styles.secondaryPill} onPress={() => navigation.navigate('Ponds')}>
+                <Ionicons name="layers-outline" size={16} color={aquapinColors.blue} />
+                <Text style={styles.secondaryPillText}>Ponds</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.primaryPill}
+                onPress={() => openStackScreen('PondMap', { requestKey: Date.now(), initialMode: 'view' })}
+              >
+                <Ionicons name="navigate-outline" size={16} color="#fff" />
+                <Text style={styles.primaryPillText}>Open Map</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.sectionHeadRow}>
+          <Text style={styles.sectionTitle}>Dashboard</Text>
+          <Text style={styles.sectionMeta}>This month</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <View style={styles.metricCard}>
+            <Text style={styles.metricLabel}>Total Ponds</Text>
+            <Text style={styles.metricValue}>{formatWholeNumber(overview.totalPonds)}</Text>
+            <View style={[styles.metricIconBadge, { backgroundColor: aquapinColors.blueSoft }]}>
+              <Ionicons name="layers-outline" size={20} color={aquapinColors.blue} />
+            </View>
+          </View>
+          <View style={styles.metricCard}>
+            <Text style={styles.metricLabel}>Total Stock</Text>
+            <Text style={styles.metricValue}>{formatCompactNumber(overview.totalStock)}</Text>
+            <View style={[styles.metricIconBadge, { backgroundColor: aquapinColors.greenSoft }]}>
+              <Ionicons name="fish-outline" size={20} color={aquapinColors.green} />
+            </View>
+          </View>
+          <View style={styles.metricCard}>
+            <Text style={styles.metricLabel}>Survival Rate</Text>
+            <Text style={styles.metricValue}>{formatPercent(overview.survivalRate)}</Text>
+            <View style={[styles.metricIconBadge, { backgroundColor: aquapinColors.blueSoft }]}>
+              <Ionicons name="pie-chart-outline" size={20} color={aquapinColors.blue} />
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.sectionHeadRow}>
+          <Text style={styles.sectionTitle}>Overview</Text>
+          <Text style={styles.sectionMeta}>{lastSync ? formatRelativeTime(lastSync.getTime()) : 'Waiting for sync'}</Text>
+        </View>
+
+        <View style={styles.analyticsRow}>
+          <View style={[styles.analyticsCard, { borderColor: aquapinColors.greenSoft }]}>
+            <Text style={styles.analyticsLabel}>Revenue Analytics</Text>
+            <Text style={[styles.analyticsValue, { color: aquapinColors.green }]}>{formatCurrencyPhp(overview.estimatedRevenue)}</Text>
+            <Text style={styles.analyticsSub}>Harvest value from recorded yields</Text>
+          </View>
+          <View style={[styles.analyticsCard, { borderColor: aquapinColors.blueSoft }]}>
+            <Text style={styles.analyticsLabel}>Water Quality</Text>
+            <Text style={[styles.analyticsValue, { color: aquapinColors.blue }]}>{waterQualityScore}%</Text>
+            <Text style={styles.analyticsSub}>Derived from recent survival and loss trends</Text>
+          </View>
+          <View style={[styles.analyticsCard, { borderColor: aquapinColors.amberSoft }]}>
+            <Text style={styles.analyticsLabel}>Sync Queue</Text>
+            <Text style={[styles.analyticsValue, { color: aquapinColors.amber }]}>{formatWholeNumber(queueSnapshot.pending)}</Text>
+            <Text style={styles.analyticsSub}>Pending offline operations</Text>
+          </View>
+        </View>
+
+        <View style={styles.sectionHeadRow}>
+          <Text style={styles.sectionTitle}>Aquapin 2.0 Modules</Text>
+          <Text style={styles.sectionMeta}>Upgraded experience</Text>
+        </View>
+
+        <View style={styles.moduleGrid}>
+          {moduleCards.map((card) => (
+            <TouchableOpacity key={card.key} style={styles.moduleCard} activeOpacity={0.92} onPress={card.onPress}>
+              <View style={styles.moduleIcon}>
+                <Ionicons name={card.icon} size={20} color={aquapinColors.blue} />
+              </View>
+              <Text style={styles.moduleTitle}>{card.title}</Text>
+              <Text style={styles.moduleSubtitle}>{card.subtitle}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        <View style={styles.sectionHeadRow}>
+          <Text style={styles.sectionTitle}>Recent Activities</Text>
+          <TouchableOpacity onPress={() => navigation.navigate('Records')}>
+            <Text style={styles.linkText}>View All</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.activityList}>
+          {overview.recentActivities.slice(0, 4).map((activity) => {
+            const tone = getActivityTone(activity.type);
+
+            return (
+              <TouchableOpacity
+                key={`${activity.type}-${activity.id}`}
+                style={styles.activityCard}
+                activeOpacity={0.9}
+                onPress={() => navigation.navigate('Records')}
+              >
+                <View style={[styles.activityIcon, { backgroundColor: tone.bg }]}>
+                  <Ionicons name={tone.icon} size={18} color={tone.fg} />
+                </View>
+                <View style={styles.activityCopy}>
+                  <Text style={styles.activityTitle}>{activity.title}</Text>
+                  <Text style={styles.activitySubtitle}>{activity.subtitle}</Text>
+                </View>
+                <View style={styles.activityMeta}>
+                  <Text style={styles.activityAmount}>{activity.amount}</Text>
+                  <Text style={styles.activityTime}>{formatRelativeTime(activity.createdAt)}</Text>
+                </View>
+              </TouchableOpacity>
+            );
+          })}
+
+          {overview.recentActivities.length === 0 && !overview.loading ? (
+            <View style={styles.emptyState}>
+              <Ionicons name="sparkles-outline" size={24} color={aquapinColors.textMuted} />
+              <Text style={styles.emptyStateTitle}>No recent farm activity yet</Text>
+              <Text style={styles.emptyStateText}>Use the center action button to create your first stocking, mortality, or harvest record.</Text>
+            </View>
+          ) : null}
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: aquapinColors.background,
+  },
+  content: {
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    paddingBottom: 140,
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 18,
+    zIndex: 20,
+  },
+  aiEntryWrap: {
+    position: 'relative',
+    width: 42,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 20,
+  },
+  iconButton: {
+    width: 42,
+    height: 42,
+    borderRadius: 16,
+    backgroundColor: aquapinColors.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: aquapinColors.border,
+  },
+  aiIntroBubble: {
+    position: 'absolute',
+    top: 50,
+    left: 0,
+    width: 208,
+    borderRadius: 18,
+    backgroundColor: aquapinColors.surface,
+    paddingHorizontal: 13,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: aquapinColors.border,
+    shadowColor: '#16335c',
+    shadowOpacity: 0.12,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 8,
+  },
+  aiIntroText: {
+    color: aquapinColors.text,
+    fontSize: 12,
+    lineHeight: 17,
+    fontWeight: '800',
+  },
+  brandBlock: {
+    alignItems: 'center',
+  },
+  brandTitle: {
+    fontSize: 24,
+    fontWeight: '900',
+    color: aquapinColors.blue,
+  },
+  brandTitleAccent: {
+    color: aquapinColors.green,
+  },
+  brandSubtitle: {
+    fontSize: 12,
+    color: aquapinColors.textMuted,
+    marginTop: 2,
+  },
+  mapCard: {
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 28,
+    padding: 18,
+    marginBottom: 20,
+    shadowColor: '#18355d',
+    shadowOpacity: 0.12,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 7,
+  },
+  sectionHeadRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  sectionTitle: {
+    color: aquapinColors.text,
+    fontSize: 20,
+    fontWeight: '800',
+  },
+  sectionMeta: {
+    color: aquapinColors.textMuted,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  linkText: {
+    color: aquapinColors.blue,
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  mapCanvas: {
+    height: 210,
+    borderRadius: 24,
+    overflow: 'hidden',
+    backgroundColor: '#dcefd7',
+    position: 'relative',
+    marginBottom: 14,
+  },
+  mapGridOverlay: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  gridLineHorizontal: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: 1,
+    backgroundColor: 'rgba(255,255,255,0.45)',
+  },
+  gridLineVertical: {
+    position: 'absolute',
+    top: 0,
+    bottom: 0,
+    width: 1,
+    backgroundColor: 'rgba(255,255,255,0.45)',
+  },
+  markerWrap: {
+    position: 'absolute',
+  },
+  markerDot: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 3,
+    borderColor: '#fff',
+  },
+  markerDotBlue: {
+    backgroundColor: '#2d8cf0',
+  },
+  markerDotGreen: {
+    backgroundColor: aquapinColors.green,
+  },
+  mapInfoCard: {
+    position: 'absolute',
+    right: 14,
+    top: 18,
+    width: 150,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.96)',
+    padding: 12,
+  },
+  mapInfoTitle: {
+    color: aquapinColors.text,
+    fontSize: 18,
+    fontWeight: '800',
+    marginBottom: 8,
+  },
+  mapInfoLine: {
+    color: aquapinColors.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  locateButton: {
+    position: 'absolute',
+    right: 16,
+    bottom: 16,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(255,255,255,0.94)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  mapFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  dotsRow: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: '#d0d9e8',
+  },
+  dotActive: {
+    backgroundColor: aquapinColors.blue,
+    width: 18,
+  },
+  mapFooterButtons: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  secondaryPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderRadius: 999,
+    backgroundColor: aquapinColors.blueSoft,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  secondaryPillText: {
+    color: aquapinColors.blue,
+    fontWeight: '700',
+  },
+  primaryPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    borderRadius: 999,
+    backgroundColor: aquapinColors.green,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  primaryPillText: {
+    color: '#fff',
+    fontWeight: '700',
+  },
+  metricRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 20,
+  },
+  metricCard: {
+    flex: 1,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 24,
+    padding: 14,
+    minHeight: 126,
+    justifyContent: 'space-between',
+  },
+  metricLabel: {
+    color: aquapinColors.textMuted,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  metricValue: {
+    color: aquapinColors.text,
+    fontSize: 28,
+    fontWeight: '900',
+  },
+  metricIconBadge: {
+    width: 42,
+    height: 42,
+    borderRadius: 15,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  analyticsRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 20,
+  },
+  analyticsCard: {
+    flex: 1,
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 24,
+    borderWidth: 1,
+    padding: 14,
+  },
+  analyticsLabel: {
+    color: aquapinColors.textMuted,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  analyticsValue: {
+    fontSize: 24,
+    fontWeight: '900',
+    marginTop: 10,
+  },
+  analyticsSub: {
+    color: aquapinColors.textMuted,
+    fontSize: 11,
+    lineHeight: 17,
+    marginTop: 8,
+  },
+  moduleGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    rowGap: 14,
+    marginBottom: 20,
+  },
+  moduleCard: {
+    width: '48%',
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 24,
+    padding: 16,
+    minHeight: 150,
+  },
+  moduleIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 15,
+    backgroundColor: aquapinColors.blueSoft,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 14,
+  },
+  moduleTitle: {
+    color: aquapinColors.text,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  moduleSubtitle: {
+    color: aquapinColors.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 8,
+  },
+  activityList: {
+    gap: 12,
+  },
+  activityCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 22,
+    paddingHorizontal: 14,
+    paddingVertical: 14,
+  },
+  activityIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  activityCopy: {
+    flex: 1,
+  },
+  activityTitle: {
+    color: aquapinColors.text,
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  activitySubtitle: {
+    color: aquapinColors.textMuted,
+    fontSize: 12,
+    marginTop: 3,
+  },
+  activityMeta: {
+    alignItems: 'flex-end',
+  },
+  activityAmount: {
+    color: aquapinColors.text,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  activityTime: {
+    color: aquapinColors.textMuted,
+    fontSize: 11,
+    marginTop: 4,
+  },
+  emptyState: {
+    backgroundColor: aquapinColors.surface,
+    borderRadius: 24,
+    paddingHorizontal: 18,
+    paddingVertical: 22,
+    alignItems: 'center',
+  },
+  emptyStateTitle: {
+    color: aquapinColors.text,
+    fontSize: 15,
+    fontWeight: '800',
+    marginTop: 12,
+  },
+  emptyStateText: {
+    color: aquapinColors.textMuted,
+    fontSize: 12,
+    textAlign: 'center',
+    lineHeight: 18,
+    marginTop: 8,
+  },
+  map: {
+    ...StyleSheet.absoluteFillObject,
+  },
+});
