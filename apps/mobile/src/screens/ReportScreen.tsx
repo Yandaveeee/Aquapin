@@ -14,7 +14,7 @@ import {
   Dimensions,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Ionicons } from '@expo/vector-icons';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import { usePonds } from '../hooks/useOfflineData';
 import { CONFIG } from '../config';
 
@@ -25,6 +25,7 @@ interface Message {
   role: 'user' | 'assistant';
   content: string;
   timestamp: Date;
+  isError?: boolean;
 }
 
 const SUGGESTED_QUESTIONS = [
@@ -50,6 +51,7 @@ export default function ReportScreen() {
   const [keyboardOffset, setKeyboardOffset] = useState(0);
   const { ponds } = usePonds();
   const scrollViewRef = useRef<ScrollView>(null);
+  const requestInFlight = useRef(false);
 
   useEffect(() => {
     const showSubscription = Keyboard.addListener(
@@ -86,7 +88,8 @@ export default function ReportScreen() {
   }, [messages, loading]);
 
   const sendMessage = async (text: string) => {
-    if (!text.trim()) return;
+    if (!text.trim() || requestInFlight.current) return;
+    requestInFlight.current = true;
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -98,10 +101,12 @@ export default function ReportScreen() {
     setMessages(prev => [...prev, userMessage]);
     setInputText('');
     setLoading(true);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
 
     try {
       if (!CONFIG.ai.groqApiKey) {
-        throw new Error('Missing Groq API key');
+        throw new Error('AI chat is not configured. Please contact your administrator.');
       }
 
       const pondContext = ponds.length > 0
@@ -110,18 +115,19 @@ export default function ReportScreen() {
 
       const response = await fetch(GROQ_API_URL, {
         method: 'POST',
+        signal: controller.signal,
         headers: {
           'Authorization': `Bearer ${CONFIG.ai.groqApiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'llama-3.1-8b-instant',
+          model: CONFIG.ai.model,
           messages: [
             {
               role: 'system',
               content: `You are AquaPin AI. ${pondContext} Give concise aquaculture advice.`,
             },
-            ...messages.slice(-3).map(m => ({ role: m.role, content: m.content })),
+            ...messages.filter(m => !m.isError).slice(-3).map(m => ({ role: m.role, content: m.content })),
             { role: 'user', content: text },
           ],
           temperature: 0.7,
@@ -129,8 +135,24 @@ export default function ReportScreen() {
         }),
       });
 
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          throw new Error('AI service access was denied. Please contact your administrator.');
+        }
+        if (response.status === 404) {
+          throw new Error('The configured AI model is unavailable. Please contact your administrator.');
+        }
+        if (response.status === 429) {
+          throw new Error('AI usage limit reached. Please wait a moment and try again.');
+        }
+        throw new Error(`AI service is unavailable (error ${response.status}). Please try again later.`);
+      }
+
       const data = await response.json();
-      const aiResponse = data.choices?.[0]?.message?.content || 'Sorry, I could not process that.';
+      const aiResponse = data.choices?.[0]?.message?.content;
+      if (typeof aiResponse !== 'string' || !aiResponse.trim()) {
+        throw new Error('The AI returned an empty response. Please try again.');
+      }
 
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(),
@@ -142,12 +164,21 @@ export default function ReportScreen() {
       setMessages(prev => [...prev, {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: CONFIG.ai.groqApiKey
-          ? 'I\'m here to help with pond management! Try asking about water quality, feeding, or harvest timing.'
-          : 'AI assistant is not configured yet. Add EXPO_PUBLIC_GROQ_API_KEY to your mobile .env file to enable chat.',
+        content: controller.signal.aborted
+          ? 'AI took too long to respond. Please try again.'
+          : error instanceof TypeError
+            ? 'Could not connect to the AI service. Check your internet connection and try again.'
+            : error instanceof SyntaxError
+              ? 'The AI service returned an invalid response. Please try again later.'
+              : error instanceof Error
+                ? error.message
+                : 'AI chat is unavailable. Please try again later.',
+        isError: true,
         timestamp: new Date(),
       }]);
     } finally {
+      clearTimeout(timeout);
+      requestInFlight.current = false;
       setLoading(false);
     }
   };

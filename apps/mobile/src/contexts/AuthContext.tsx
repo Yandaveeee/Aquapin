@@ -231,6 +231,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let isMounted = true;
+    // Startup reads may finish after SIGNED_IN. They must never replace a newer
+    // auth event (or clear its newly persisted session).
+    let authEventRevision = 0;
+    let receivedLiveAuthEvent = false;
 
     const applySessionState = (nextSession: Session | null) => {
       if (!isMounted) return;
@@ -276,6 +280,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           await AsyncStorage.setItem(AUTH_LAST_ACTIVE_USER_STORAGE_KEY, nextUserId);
         }
 
+        if (!isMounted || requestId !== authTransitionIdRef.current) return;
         finishInitialization();
       } catch (error) {
         if (!isMounted || requestId !== authTransitionIdRef.current) return;
@@ -294,16 +299,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     const bootstrapAuth = async () => {
+      const startupRevision = authEventRevision;
+      const isCurrentStartup = () => isMounted && authEventRevision === startupRevision;
       const cachedSession = await readStoredSession();
+      if (!isCurrentStartup()) return;
       if (cachedSession) {
         await resolveAuthState(cachedSession, { allowLegacyReset: false });
       } else {
         finishInitialization();
       }
 
+      if (!isCurrentStartup()) return;
       try {
         const { data: { session: liveSession }, error } = await supabase.auth.getSession();
-        if (!isMounted) return;
+        if (!isCurrentStartup()) return;
 
         if (error) {
           if (isInvalidRefreshTokenError(error)) {
@@ -318,7 +327,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         await resolveAuthState(liveSession, { allowLegacyReset: true });
       } catch (error) {
-        if (!isMounted) return;
+        if (!isCurrentStartup()) return;
 
         if (isInvalidRefreshTokenError(error)) {
           console.warn('Expired auth session detected during startup. Clearing local session.');
@@ -350,7 +359,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             return;
           }
 
-          await resolveAuthState(data.session, { allowLegacyReset: true });
+          // setSession / exchangeCodeForSession emit the authoritative auth event.
           if (data.session) {
             const { error: activityError } = await supabase.rpc('record_staff_session');
             if (activityError) {
@@ -368,7 +377,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             return;
           }
 
-          await resolveAuthState(data.session, { allowLegacyReset: true });
+          // setSession / exchangeCodeForSession emit the authoritative auth event.
           if (data.session) {
             const { error: activityError } = await supabase.rpc('record_staff_session');
             if (activityError) {
@@ -390,8 +399,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Listen for auth state changes.
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event: any, session: any) => {
       if (!isMounted) return;
+      if (event === 'INITIAL_SESSION' && receivedLiveAuthEvent) return;
+      if (event !== 'INITIAL_SESSION') receivedLiveAuthEvent = true;
+      authEventRevision += 1;
 
       if (event === 'SIGNED_OUT' || !session) {
+        // Invalidate pending async reconciliation as well as startup reads.
+        authTransitionIdRef.current += 1;
         setSession(null);
         setUser(null);
         setIsInitializing(false);
@@ -403,6 +417,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       isMounted = false;
+      authTransitionIdRef.current += 1;
       linkingSubscription.remove();
       subscription.unsubscribe();
     };

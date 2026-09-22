@@ -9,6 +9,7 @@ declare module '@nozbe/watermelondb' {
     markAsDeleted(): Promise<void>;
     destroyPermanently(): Promise<void>;
   }
+  export const Q: typeof import('@nozbe/watermelondb/QueryDescription');
   export const appSchema: any;
   export const tableSchema: any;
   export class Database {

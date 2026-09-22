@@ -1,5 +1,5 @@
-import { AdminApprovalsLoading } from "@/components/admin/AdminLoading";
+import { AdminFeatureLoading } from "@/components/admin/AdminLoading";
 
 export default function Loading() {
-  return <AdminApprovalsLoading />;
+  return <AdminFeatureLoading label="ponds" />;
 }

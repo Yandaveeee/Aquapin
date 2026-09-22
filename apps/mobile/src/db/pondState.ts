@@ -1,5 +1,6 @@
 import { database, mockDatabase } from './index'
 import { Pond } from './models'
+import { fetchPondRecords } from './queries'
 import { enqueueSyncOperation } from './syncQueue'
 
 const isMock = !database
@@ -79,15 +80,12 @@ export function derivePondStateFromRecords(
 ): DerivedPondState {
   const pondStockings = records.stockings
     .filter((item) => getPondId(item) === pondId)
-    .sort((a, b) => toTimestamp(a?.createdAt ?? a?.created_at) - toTimestamp(b?.createdAt ?? b?.created_at))
 
   const pondHarvests = records.harvests
     .filter((item) => getPondId(item) === pondId)
-    .sort((a, b) => toTimestamp(a?.createdAt ?? a?.created_at) - toTimestamp(b?.createdAt ?? b?.created_at))
 
   const pondMortalities = records.mortalities
     .filter((item) => getPondId(item) === pondId)
-    .sort((a, b) => toTimestamp(a?.createdAt ?? a?.created_at) - toTimestamp(b?.createdAt ?? b?.created_at))
 
   const latestFullHarvestAt = pondHarvests.reduce((latest, harvest) => {
     if (isHarvestPartial(harvest)) return latest
@@ -137,7 +135,16 @@ export function derivePondStateFromRecords(
   }
 }
 
-async function loadRecords() {
+async function loadRecords(pondId?: string) {
+  if (pondId) {
+    const [pond, stockings, harvests, mortalities] = await Promise.all([
+      isMock ? mockDatabase.get(`pond:${pondId}`) : database.collections.get('ponds').find(pondId),
+      fetchPondRecords('stocking_logs', pondId),
+      fetchPondRecords('harvests', pondId),
+      fetchPondRecords('mortality_logs', pondId),
+    ])
+    return { ponds: pond ? [pond] : [], stockings, harvests, mortalities }
+  }
   const [ponds, stockings, harvests, mortalities] = await Promise.all([
     isMock ? mockDatabase.getAll('pond:') : database.collections.get('ponds').query().fetch(),
     isMock ? mockDatabase.getAll('stocking:') : database.collections.get('stocking_logs').query().fetch(),
@@ -168,7 +175,7 @@ export async function recomputePondState(
   const normalizedPondId = toId(pondId)
   if (!normalizedPondId) return null
 
-  const { ponds, stockings, harvests, mortalities } = await loadRecords()
+  const { ponds, stockings, harvests, mortalities } = await loadRecords(normalizedPondId)
   const pond = ponds.find((item: any) => toId(item?.id) === normalizedPondId)
   if (!pond) return null
 
@@ -229,12 +236,27 @@ export async function recomputeAllPondStates(options: { queueUpdate?: boolean } 
     return
   }
 
+  // Partition once rather than scanning every transaction for every pond.
+  const byPond = new Map<string, { stockings: any[]; harvests: any[]; mortalities: any[] }>()
+  for (const [kind, rows] of Object.entries({ stockings, harvests, mortalities })) {
+    for (const row of rows as any[]) {
+      const id = getPondId(row)
+      let records = byPond.get(id)
+      if (!records) {
+        records = { stockings: [], harvests: [], mortalities: [] }
+        byPond.set(id, records)
+      }
+      records[kind as keyof typeof records].push(row)
+    }
+  }
+  const recordsFor = (id: string) => byPond.get(id) || { stockings: [], harvests: [], mortalities: [] }
+
   if (isMock) {
     for (const pond of ponds as any[]) {
       const pondId = toId(pond?.id)
       if (!pondId) continue
 
-      const nextState = derivePondStateFromRecords(pondId, { stockings, harvests, mortalities })
+      const nextState = derivePondStateFromRecords(pondId, recordsFor(pondId))
       if (!pondStateChanged(pond, nextState)) continue
 
       const nextPond = {
@@ -262,11 +284,12 @@ export async function recomputeAllPondStates(options: { queueUpdate?: boolean } 
   const queuedUpdates: Array<{ pondId: string; payload: Record<string, any> }> = []
 
   await database.write(async () => {
+    const updates = []
     for (const pond of ponds as Pond[]) {
       const pondId = toId((pond as any)?.id)
       if (!pondId) continue
 
-      const nextState = derivePondStateFromRecords(pondId, { stockings, harvests, mortalities })
+      const nextState = derivePondStateFromRecords(pondId, recordsFor(pondId))
       if (!pondStateChanged(pond, nextState)) continue
 
       if (options.queueUpdate) {
@@ -276,12 +299,13 @@ export async function recomputeAllPondStates(options: { queueUpdate?: boolean } 
         })
       }
 
-      await pond.update((record: any) => {
+      updates.push(pond.prepareUpdate((record: any) => {
         record.isActive = nextState.isActive
         record.currentSpecies = nextState.currentSpecies || ''
         record.currentStockCount = nextState.currentStockCount
-      })
+      }))
     }
+    if (updates.length) await database.batch(...updates)
   })
 
   if (options.queueUpdate) {

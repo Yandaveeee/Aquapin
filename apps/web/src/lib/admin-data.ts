@@ -11,15 +11,6 @@ type SettingsRow = Pick<
   Database["public"]["Tables"]["admin_settings"]["Row"],
   "section" | "value"
 >;
-
-let shellDataCache: { data: ShellData; expiresAt: number } | null = null;
-let settingsSnapshotCache: { data: any; expiresAt: number } | null = null;
-const CACHE_TTL_MS = 10000;
-
-export function clearAdminDataCache() {
-  shellDataCache = null;
-  settingsSnapshotCache = null;
-}
 type PondSummaryRow = Pick<
   Database["public"]["Tables"]["ponds"]["Row"],
   "id" | "name" | "is_active" | "current_stock_count"
@@ -37,6 +28,7 @@ export type ShellData = {
   attentionCount: number;
   navBadges: {
     dashboard: number;
+    approvals: number;
     settings: number;
   };
 };
@@ -235,11 +227,7 @@ async function countEventsBetween(supabase: SupabaseClient, sinceIso: string, un
   return counts.reduce((sum, value) => sum + value, 0);
 }
 
-async function getSettingsSnapshot(supabase: SupabaseClient) {
-  if (settingsSnapshotCache && Date.now() < settingsSnapshotCache.expiresAt) {
-    return settingsSnapshotCache.data;
-  }
-
+const getSettingsSnapshot = cache(async function getSettingsSnapshot(supabase: SupabaseClient) {
   const { data, error } = await supabase
     .from("admin_settings")
     .select("section, value")
@@ -252,17 +240,14 @@ async function getSettingsSnapshot(supabase: SupabaseClient) {
   const rows = (data ?? []) as SettingsRow[];
   const rowMap = new Map(rows.map((row) => [row.section, row.value]));
 
-  const result = {
+  return {
     general: normalizeAdminSettingSection("general", rowMap.get("general")),
     operations: normalizeAdminSettingSection("operations", rowMap.get("operations")),
     notifications: normalizeAdminSettingSection("notifications", rowMap.get("notifications")),
   };
+});
 
-  settingsSnapshotCache = { data: result, expiresAt: Date.now() + CACHE_TTL_MS };
-  return result;
-}
-
-async function getStalePonds(supabase: SupabaseClient, staleSyncMinutes: number) {
+const getStalePonds = cache(async function getStalePonds(supabase: SupabaseClient, staleSyncMinutes: number) {
   const sinceIso = new Date(Date.now() - staleSyncMinutes * 60 * 1000).toISOString();
   const [{ data: activePondsData, error: activePondsError }, { data: recentHistoryData, error: recentHistoryError }] =
     await Promise.all([
@@ -287,13 +272,9 @@ async function getStalePonds(supabase: SupabaseClient, staleSyncMinutes: number)
   const recentPondIds = new Set(recentHistoryRows.map((row) => row.pond_id));
 
   return activePonds.filter((pond) => !recentPondIds.has(pond.id));
-}
+});
 
-export const getAdminShellData = cache(async function getAdminShellData(): Promise<ShellData> {
-  if (shellDataCache && Date.now() < shellDataCache.expiresAt) {
-    return shellDataCache.data;
-  }
-
+export async function getAdminShellData(): Promise<ShellData> {
   const { cookies } = await import("next/headers");
   const cookieStore = await cookies();
   const isMock = cookieStore.get("aquapin_mock_admin")?.value === "true";
@@ -304,17 +285,19 @@ export const getAdminShellData = cache(async function getAdminShellData(): Promi
       attentionCount: 1,
       navBadges: {
         dashboard: 1,
+        approvals: 0,
         settings: 2,
       },
     };
   }
 
   const supabase = await createSupabaseServerClient();
-  const [settingsSnapshot, settingsChanges24h] = await Promise.all([
+  const [settingsSnapshot, settingsChanges24h, pendingApprovals] = await Promise.all([
     getSettingsSnapshot(supabase),
     countRows(supabase, "admin_settings_audit", (query) =>
       query.gte("changed_at", new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
     ),
+    countRows(supabase, "public_profiles", (query) => query.eq("status", "pending")),
   ]);
 
   const lowStockThreshold = settingsSnapshot.operations.lowStockThreshold;
@@ -331,18 +314,16 @@ export const getAdminShellData = cache(async function getAdminShellData(): Promi
     (count) => count > 0
   ).length;
 
-  const shellResult: ShellData = {
+  return {
     organizationName: settingsSnapshot.general.organizationName,
     attentionCount,
     navBadges: {
       dashboard: attentionCount,
+      approvals: pendingApprovals,
       settings: settingsChanges24h,
     },
   };
-
-  shellDataCache = { data: shellResult, expiresAt: Date.now() + CACHE_TTL_MS };
-  return shellResult;
-});
+}
 
 export async function getDashboardOverview(days: number): Promise<DashboardOverview> {
   const { cookies } = await import("next/headers");
@@ -488,16 +469,7 @@ export async function getDashboardOverview(days: number): Promise<DashboardOverv
   const previous24h = new Date(now - 48 * 60 * 60 * 1000).toISOString();
   const feedSince = new Date(now - days * 24 * 60 * 60 * 1000).toISOString();
 
-  const [
-    settingsSnapshot,
-    totalStaff,
-    totalPonds,
-    activePonds,
-    events24h,
-    eventsPrevious24h,
-    settingsChanges24h,
-  ] = await Promise.all([
-    getSettingsSnapshot(supabase),
+  const metricsPromise = Promise.all([
     countRows(supabase, "public_profiles", (query) => query.eq("role", "field_staff")),
     countRows(supabase, "ponds"),
     countRows(supabase, "ponds", (query) => query.eq("is_active", true)),
@@ -505,6 +477,8 @@ export async function getDashboardOverview(days: number): Promise<DashboardOverv
     countEventsBetween(supabase, previous24h, since24h),
     countRows(supabase, "admin_settings_audit", (query) => query.gte("changed_at", since24h)),
   ]);
+
+  const settingsSnapshot = await getSettingsSnapshot(supabase);
 
   const lowStockThreshold = settingsSnapshot.operations.lowStockThreshold;
   const staleSyncMinutes = settingsSnapshot.notifications.staleSyncMinutes;
@@ -548,19 +522,19 @@ export async function getDashboardOverview(days: number): Promise<DashboardOverv
   const pondIds = new Set(recentEvents.map((event) => event.pond_id));
   const actorIds = new Set(recentEvents.map((event) => event.recorded_by));
 
-  const pondLabelRows = (
+  const [pondLabelsResult, actorLabelsResult] = await Promise.all([
     pondIds.size > 0
-      ? ((await supabase.from("ponds").select("id, name").in("id", Array.from(pondIds))).data ?? [])
-      : []
-  ) as Array<{ id: string; name: string }>;
-  const actorLabelRows = (
+      ? supabase.from("ponds").select("id, name").in("id", Array.from(pondIds))
+      : Promise.resolve({ data: [] }),
     actorIds.size > 0
-      ? ((await supabase
-          .from("public_profiles")
-          .select("id, email")
-          .in("id", Array.from(actorIds))).data ?? [])
-      : []
-  ) as ProfileLabelRow[];
+      ? supabase.from("public_profiles").select("id, email").in("id", Array.from(actorIds))
+      : Promise.resolve({ data: [] }),
+  ]);
+  const pondLabelRows = (pondLabelsResult.data ?? []) as Array<{ id: string; name: string }>;
+  const actorLabelRows = (actorLabelsResult.data ?? []) as ProfileLabelRow[];
+
+  const [totalStaff, totalPonds, activePonds, events24h, eventsPrevious24h, settingsChanges24h] =
+    await metricsPromise;
 
   const pondMap = new Map(pondLabelRows.map((row) => [row.id, row.name]));
   const actorMap = new Map(actorLabelRows.map((row) => [row.id, row.email]));

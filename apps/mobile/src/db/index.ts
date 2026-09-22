@@ -1,4 +1,10 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { notifyLocalChange } from './changes';
+
+const TABLE_BY_PREFIX: Record<string, string> = {
+  pond: 'ponds', mortality: 'mortality_logs', harvest: 'harvests',
+  stocking: 'stocking_logs', history: 'pond_history',
+};
 
 // Mock WatermelonDB for Expo Go compatibility
 // In production, you should use a custom development build with WatermelonDB native modules
@@ -46,6 +52,11 @@ try {
 // AsyncStorage-based mock database
 class MockDatabase {
   private prefix = LOCAL_DB_STORAGE_PREFIX;
+  private persistedValues = new Map<string, string>();
+
+  clearCache() {
+    this.persistedValues.clear();
+  }
 
   async get(key: string): Promise<any> {
     try {
@@ -59,17 +70,29 @@ class MockDatabase {
 
   async set(key: string, value: any): Promise<void> {
     try {
-      await AsyncStorage.setItem(this.prefix + key, JSON.stringify(value));
+      const serialized = JSON.stringify(value);
+      if (this.persistedValues.get(key) === serialized) return;
+      await AsyncStorage.setItem(this.prefix + key, serialized);
+      this.persistedValues.delete(key);
+      this.persistedValues.set(key, serialized);
+      if (this.persistedValues.size > 1000) {
+        this.persistedValues.delete(this.persistedValues.keys().next().value!);
+      }
+      notifyLocalChange(TABLE_BY_PREFIX[key.split(':')[0]] || '*');
     } catch (e) {
       console.error('MockDB set error:', e);
+      throw e;
     }
   }
 
   async remove(key: string): Promise<void> {
     try {
       await AsyncStorage.removeItem(this.prefix + key);
+      this.persistedValues.delete(key);
+      notifyLocalChange(TABLE_BY_PREFIX[key.split(':')[0]] || '*');
     } catch (e) {
       console.error('MockDB remove error:', e);
+      throw e;
     }
   }
 
@@ -210,6 +233,7 @@ class MockDatabase {
 }
 
 export async function clearLocalDatabase(): Promise<void> {
+  mockDatabase.clearCache();
   if (database && typeof (database as any).unsafeResetDatabase === 'function') {
     await (database as any).write(async () => {
       await (database as any).unsafeResetDatabase();
@@ -221,6 +245,7 @@ export async function clearLocalDatabase(): Promise<void> {
   if (appKeys.length > 0) {
     await AsyncStorage.multiRemove(appKeys);
   }
+  notifyLocalChange('*');
 }
 
 // Export either real database or mock

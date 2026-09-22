@@ -1,5 +1,5 @@
 import type { Database, SettingSection } from "@aquapin/shared";
-import AdminPageHeader from "@/components/admin/AdminPageHeader";
+import ConfirmSubmitButton from "@/components/admin/ConfirmSubmitButton";
 import SettingsAuditDiff from "@/components/admin/SettingsAuditDiff";
 import SettingsSectionForm from "@/components/admin/SettingsSectionForm";
 import { updateAdminSettingAction } from "@/app/admin/settings/actions";
@@ -108,16 +108,12 @@ export default async function AdminSettingsPage({ searchParams }: AdminSettingsP
     }
   }
 
-  const sectionStates = buildSettingsSectionStates(settingsRows);
+  const sectionStates = buildSettingsSectionStates(settingsRows).filter((state) =>
+    ["general", "operations", "notifications"].includes(state.section)
+  );
 
   return (
     <section className="stack">
-      <AdminPageHeader
-        eyebrow="Configuration"
-        title="Settings"
-        description="Manage essential organization, pond-alert, and notification settings for AquaPin."
-      />
-
       {params?.saved ? (
         <p className="flash-success">
           Saved <strong>{SETTINGS_SECTION_META[params.saved as SettingSection]?.title ?? params.saved}</strong>{" "}
@@ -126,35 +122,7 @@ export default async function AdminSettingsPage({ searchParams }: AdminSettingsP
       ) : null}
       {params?.error ? <p className="flash-error">{params.error}</p> : null}
 
-      <div className="card-grid three-col">
-        <article className="metric-card">
-          <p className="metric-label">Sections</p>
-          <p className="metric-value">{sectionStates.length}</p>
-          <p className="metric-detail">Validated settings groups in the console</p>
-        </article>
-        <article className="metric-card">
-          <p className="metric-label">Audit Entries</p>
-          <p className="metric-value">{auditRows.length}</p>
-          <p className="metric-detail">Recent settings changes available for review</p>
-        </article>
-        <article className="metric-card">
-          <p className="metric-label">Latest Change</p>
-          <p className="metric-value">{auditRows[0] ? formatDateTime(auditRows[0].changed_at) : "None"}</p>
-          <p className="metric-detail">Most recent configuration write</p>
-        </article>
-      </div>
-
       <article className="panel">
-        <div className="panel-header-row">
-          <div>
-            <h3 className="panel-title">Section Editors</h3>
-            <p className="panel-subtitle">
-              Keep the core settings that support the mobile field workflow up to date.
-            </p>
-          </div>
-          <span className="ui-pill ui-pill-ghost">Structured forms</span>
-        </div>
-
         <div className="settings-grid">
           {sectionStates.map((state) => (
             <SettingsSectionForm
@@ -170,16 +138,8 @@ export default async function AdminSettingsPage({ searchParams }: AdminSettingsP
         </div>
       </article>
 
-      <article className="panel">
-        <div className="panel-header-row">
-          <div>
-            <h3 className="panel-title">Recent Settings Audit</h3>
-            <p className="panel-subtitle">
-              Review field-level diffs and restore a previous configuration snapshot when needed.
-            </p>
-          </div>
-          <span className="ui-pill ui-pill-ghost">{auditRows.length} entries</span>
-        </div>
+      <details className="panel detail-disclosure">
+        <summary>Recent settings changes ({auditRows.length})</summary>
 
         <div className="settings-audit-list">
           {auditRows.length > 0 ? (
@@ -210,9 +170,10 @@ export default async function AdminSettingsPage({ searchParams }: AdminSettingsP
                           name="value"
                           value={JSON.stringify(row.previous_value)}
                         />
-                        <button className="secondary-button" type="submit">
-                          Restore Previous
-                        </button>
+                        <ConfirmSubmitButton
+                          label="Restore previous"
+                          message={`Restore this ${SETTINGS_SECTION_META[section]?.title ?? row.section} configuration from ${formatDateTime(row.changed_at)}? This will replace its current values and create a new audit entry.`}
+                        />
                       </form>
                     ) : null}
                   </div>
@@ -223,19 +184,7 @@ export default async function AdminSettingsPage({ searchParams }: AdminSettingsP
                     nextValue={row.new_value}
                   />
 
-                  <details className="detail-disclosure">
-                    <summary>View raw before/after payload</summary>
-                    <div className="settings-raw-grid">
-                      <div>
-                        <strong>Previous</strong>
-                        <pre>{JSON.stringify(row.previous_value ?? {}, null, 2)}</pre>
-                      </div>
-                      <div>
-                        <strong>New</strong>
-                        <pre>{JSON.stringify(row.new_value, null, 2)}</pre>
-                      </div>
-                    </div>
-                  </details>
+
                 </article>
               );
             })
@@ -246,7 +195,7 @@ export default async function AdminSettingsPage({ searchParams }: AdminSettingsP
             </div>
           )}
         </div>
-      </article>
+      </details>
     </section>
   );
 }

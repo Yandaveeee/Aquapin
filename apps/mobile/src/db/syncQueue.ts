@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage'
+import { notifySyncStateChanged } from './syncEvents'
 
 export type SyncEntity =
   | 'ponds'
@@ -114,8 +115,18 @@ function parseQueue(raw: string | null): SyncQueueItem[] {
   }
 }
 
+// Serialize read/modify/write operations so saves and background sync cannot
+// replace one another's queue updates. A failed write does not poison the lock.
+let queueWrite: Promise<unknown> = Promise.resolve()
+function serializeQueueWrite<T>(work: () => Promise<T>): Promise<T> {
+  const result = queueWrite.then(work)
+  queueWrite = result.catch(() => undefined)
+  return result
+}
+
 async function persistQueue(items: SyncQueueItem[]): Promise<void> {
   await AsyncStorage.setItem(SYNC_QUEUE_KEY, JSON.stringify(items))
+  notifySyncStateChanged()
 }
 
 export async function loadSyncQueue(): Promise<SyncQueueItem[]> {
@@ -123,15 +134,16 @@ export async function loadSyncQueue(): Promise<SyncQueueItem[]> {
   return parseQueue(raw)
 }
 
-export async function saveSyncQueue(items: SyncQueueItem[]): Promise<void> {
+async function saveSyncQueueUnlocked(items: SyncQueueItem[]): Promise<void> {
   await persistQueue(items)
 }
 
-export async function clearSyncQueue(): Promise<void> {
+async function clearSyncQueueUnlocked(): Promise<void> {
   await AsyncStorage.removeItem(SYNC_QUEUE_KEY)
+  notifySyncStateChanged()
 }
 
-export async function clearSyncRuntimeState(): Promise<void> {
+async function clearSyncRuntimeStateUnlocked(): Promise<void> {
   const keys = await AsyncStorage.getAllKeys()
   const syncKeys = keys.filter(
     (key) =>
@@ -145,6 +157,7 @@ export async function clearSyncRuntimeState(): Promise<void> {
   if (syncKeys.length > 0) {
     await AsyncStorage.multiRemove(syncKeys)
   }
+  notifySyncStateChanged()
 }
 
 export function getRetryDelayMs(attempts: number): number {
@@ -190,7 +203,7 @@ function mergeForUpsert(existing: SyncQueueItem, next: SyncQueueItem): SyncQueue
   }
 }
 
-export async function enqueueSyncOperation(input: {
+async function enqueueSyncOperationUnlocked(input: {
   entity: SyncEntity
   operation: SyncOperation
   localId: string
@@ -256,7 +269,7 @@ export async function enqueueSyncOperation(input: {
   return nextBase
 }
 
-export async function updateSyncQueueItem(
+async function updateSyncQueueItemUnlocked(
   itemId: string,
   mutator: (item: SyncQueueItem) => SyncQueueItem
 ): Promise<SyncQueueItem | null> {
@@ -318,7 +331,7 @@ export async function markSyncItemStatus(
   })
 }
 
-export async function markSyncItemsAsSynced(
+async function markSyncItemsAsSyncedUnlocked(
   itemIds: string[],
   remoteIdsByItemId?: Record<string, string>
 ): Promise<void> {
@@ -346,7 +359,7 @@ export async function markSyncItemsAsSynced(
   await persistQueue(cleanupQueue(next))
 }
 
-export async function resetQueueItemsToQueued(itemIds: string[]): Promise<void> {
+async function resetQueueItemsToQueuedUnlocked(itemIds: string[]): Promise<void> {
   if (itemIds.length === 0) return
   const queue = await loadSyncQueue()
   const idSet = new Set(itemIds)
@@ -363,7 +376,7 @@ export async function resetQueueItemsToQueued(itemIds: string[]): Promise<void> 
   await persistQueue(cleanupQueue(next))
 }
 
-export async function removeSyncedQueueItems(olderThanMs: number = 20_000): Promise<void> {
+async function removeSyncedQueueItemsUnlocked(olderThanMs: number = 20_000): Promise<void> {
   const queue = await loadSyncQueue()
   const now = nowTs()
   const next = queue.filter((item) => {
@@ -496,15 +509,18 @@ export async function saveSyncSettings(partial: Partial<SyncSettings>): Promise<
     ),
   }
   await AsyncStorage.setItem(SYNC_SETTINGS_KEY, JSON.stringify(next))
+  notifySyncStateChanged()
   return next
 }
 
 export async function setLastPushAt(timestamp: number): Promise<void> {
   await AsyncStorage.setItem(SYNC_LAST_PUSH_AT_KEY, String(timestamp))
+  notifySyncStateChanged()
 }
 
 export async function setLastPullAt(timestamp: number): Promise<void> {
   await AsyncStorage.setItem(SYNC_LAST_PULL_AT_KEY, String(timestamp))
+  notifySyncStateChanged()
 }
 
 export async function getSyncTimestamps(): Promise<{
@@ -526,4 +542,42 @@ export async function getSyncTimestamps(): Promise<{
     lastPushAt: parse(pushRaw),
     lastPullAt: parse(pullRaw),
   }
+}
+
+export const saveSyncQueue = (...args: Parameters<typeof saveSyncQueueUnlocked>) =>
+  serializeQueueWrite(() => saveSyncQueueUnlocked(...args))
+
+export const clearSyncQueue = (...args: Parameters<typeof clearSyncQueueUnlocked>) =>
+  serializeQueueWrite(() => clearSyncQueueUnlocked(...args))
+
+export const clearSyncRuntimeState = (...args: Parameters<typeof clearSyncRuntimeStateUnlocked>) =>
+  serializeQueueWrite(() => clearSyncRuntimeStateUnlocked(...args))
+
+export const enqueueSyncOperation = (...args: Parameters<typeof enqueueSyncOperationUnlocked>) =>
+  serializeQueueWrite(() => enqueueSyncOperationUnlocked(...args))
+
+export const updateSyncQueueItem = (...args: Parameters<typeof updateSyncQueueItemUnlocked>) =>
+  serializeQueueWrite(() => updateSyncQueueItemUnlocked(...args))
+
+export const markSyncItemsAsSynced = (...args: Parameters<typeof markSyncItemsAsSyncedUnlocked>) =>
+  serializeQueueWrite(() => markSyncItemsAsSyncedUnlocked(...args))
+
+export const resetQueueItemsToQueued = (...args: Parameters<typeof resetQueueItemsToQueuedUnlocked>) =>
+  serializeQueueWrite(() => resetQueueItemsToQueuedUnlocked(...args))
+
+export const removeSyncedQueueItems = (...args: Parameters<typeof removeSyncedQueueItemsUnlocked>) =>
+  serializeQueueWrite(() => removeSyncedQueueItemsUnlocked(...args))
+
+// Commit only the item this upload processed. A new local revision stays queued,
+// while retaining the remote ID returned by a successful create.
+export function commitSyncResult(original: SyncQueueItem, result: SyncQueueItem): Promise<void> {
+  return serializeQueueWrite(async () => {
+    const queue = await loadSyncQueue()
+    const next = queue.map(item => {
+      if (item.id !== original.id) return item
+      if (JSON.stringify(item) === JSON.stringify(original)) return result
+      return { ...item, remoteId: result.remoteId || item.remoteId }
+    })
+    await persistQueue(next)
+  })
 }

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
+import { watchLocalData } from '../db/queries';
 import { database, mockDatabase } from '../db';
 
 const db = database || mockDatabase;
 const isMock = !database;
-const POLL_INTERVAL_MS = 3000;
 const AVG_PRICE_PER_KG = 185;
 
 function getCollection(name: string) {
@@ -87,7 +88,7 @@ const EMPTY_OVERVIEW: FarmOverview = {
 export function useFarmOverview() {
   const [overview, setOverview] = useState<FarmOverview>(EMPTY_OVERVIEW);
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (isCancelled: () => boolean) => {
     try {
       const [ponds, stockingLogs, mortalityLogs, harvests] = await Promise.all([
         getCollection('ponds').query().fetch(),
@@ -166,6 +167,7 @@ export function useFarmOverview() {
 
       const latestActivityAt = recentActivities.length > 0 ? recentActivities[0].createdAt : null;
 
+      if (isCancelled()) return;
       setOverview({
         loading: false,
         totalPonds,
@@ -184,28 +186,19 @@ export function useFarmOverview() {
       });
     } catch (error) {
       console.error('Error loading farm overview:', error);
+      if (isCancelled()) return;
       setOverview((current) => ({ ...current, loading: false }));
     }
   }, []);
 
-  useEffect(() => {
-    let unmounted = false;
-
-    const run = async () => {
-      await refresh();
-      if (unmounted) return;
-    };
-
-    void run();
-    const interval = setInterval(() => {
-      void refresh();
-    }, POLL_INTERVAL_MS);
-
-    return () => {
-      unmounted = true;
-      clearInterval(interval);
-    };
-  }, [refresh]);
+  useFocusEffect(useCallback(() => {
+    let cancelled = false;
+    const stop = watchLocalData(
+      ['ponds', 'stocking_logs', 'mortality_logs', 'harvests'],
+      () => refresh(() => cancelled)
+    );
+    return () => { cancelled = true; stop(); };
+  }, [refresh]));
 
   return overview;
 }

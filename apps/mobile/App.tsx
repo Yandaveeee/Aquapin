@@ -5,6 +5,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { AuthProvider, useAuth } from './src/contexts/AuthContext';
 import { AppearanceProvider, useAppearance } from './src/contexts/AppearanceContext';
 import { RealtimeSyncBridge } from './src/components/RealtimeSyncBridge';
+import { SyncProvider } from './src/hooks/useOfflineData';
 import AppNavigator from './src/navigation/AppNavigator';
 
 // Splash screen component shown during auth initialization
@@ -49,11 +50,11 @@ function AppFrame() {
   const { isDarkMode } = useAppearance();
 
   return (
-    <>
+    <SyncProvider key={user?.id || 'signed-out'} enabled={!!user}>
       <RealtimeSyncBridge />
       <Root />
       <StatusBar style={user && isDarkMode ? 'light' : 'dark'} />
-    </>
+    </SyncProvider>
   );
 }
 

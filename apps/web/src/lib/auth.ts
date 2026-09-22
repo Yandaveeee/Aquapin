@@ -12,7 +12,9 @@ export const getCurrentUserAndProfile = cache(async function getCurrentUserAndPr
 }> {
   const { cookies } = await import("next/headers");
   const cookieStore = await cookies();
-  const isMock = cookieStore.get("aquapin_mock_admin")?.value === "true";
+  const isMock =
+    process.env.NEXT_PUBLIC_ENABLE_MOCK_ADMIN === "true" &&
+    cookieStore.get("aquapin_mock_admin")?.value === "true";
 
   if (isMock) {
     return {
@@ -67,7 +69,7 @@ export const getCurrentUserAndProfile = cache(async function getCurrentUserAndPr
   };
 });
 
-export const requireApprovedAdmin = cache(async function requireApprovedAdmin(): Promise<{
+export async function requireApprovedAdmin(): Promise<{
   user: User;
   profile: PublicProfile;
 }> {
@@ -88,4 +90,4 @@ export const requireApprovedAdmin = cache(async function requireApprovedAdmin():
     user: user as User,
     profile: profile as PublicProfile,
   };
-});
+}

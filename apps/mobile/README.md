@@ -71,9 +71,15 @@ Create `.env` file:
 EXPO_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
 EXPO_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
 EXPO_PUBLIC_GROQ_API_KEY=your-groq-api-key
+# Optional. Defaults to openai/gpt-oss-20b; must be available to your Groq API key.
+EXPO_PUBLIC_GROQ_MODEL=openai/gpt-oss-20b
 # Optional. Defaults to aquapin://auth/callback for standalone email confirmation links.
 EXPO_PUBLIC_AUTH_EMAIL_REDIRECT_URL=aquapin://auth/callback
 ```
+
+AI chat calls Groq directly and requires an internet connection. Restart Metro after
+changing its environment variables; installed standalone apps need a new build to
+pick up changes to the AI model or key.
 
 ## Supabase Auth Email Redirects
 

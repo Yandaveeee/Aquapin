@@ -1,8 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import { AppState } from 'react-native';
-import NetInfo from '@react-native-community/netinfo';
 import { useAuth } from '../contexts/AuthContext';
-import { syncData } from '../db/sync';
+import { useSync } from '../hooks/useOfflineData';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 
 const REALTIME_TABLES = ['ponds', 'stocking_logs', 'mortality_logs', 'harvests', 'pond_history'] as const;
@@ -11,6 +10,11 @@ const FOREGROUND_SYNC_DELAY_MS = 500;
 
 export function RealtimeSyncBridge() {
   const { user } = useAuth();
+  const { performSync, syncSettings } = useSync();
+  const performSyncRef = useRef(performSync);
+  const settingsRef = useRef(syncSettings);
+  performSyncRef.current = performSync;
+  settingsRef.current = syncSettings;
   const syncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const syncInFlightRef = useRef(false);
   const pendingSyncRef = useRef(false);
@@ -30,18 +34,7 @@ export function RealtimeSyncBridge() {
     };
 
     const runSync = async () => {
-      if (cancelled) return;
-
-      const netInfo = await NetInfo.fetch().catch(() => null);
-      const connected = !!netInfo?.isConnected;
-      const reachable =
-        netInfo?.isInternetReachable === null || netInfo?.isInternetReachable === undefined
-          ? connected
-          : !!netInfo.isInternetReachable;
-
-      if (!connected || !reachable) {
-        return;
-      }
+      if (cancelled || AppState.currentState !== 'active' || !settingsRef.current.autoSync) return;
 
       if (syncInFlightRef.current) {
         pendingSyncRef.current = true;
@@ -51,7 +44,9 @@ export function RealtimeSyncBridge() {
       syncInFlightRef.current = true;
 
       try {
-        await syncData();
+        if (cancelled) return;
+        const result = await performSyncRef.current();
+        if (result.message === 'Sync already in progress.') pendingSyncRef.current = true;
       } catch (_error) {
         // Best-effort background refresh only.
       } finally {

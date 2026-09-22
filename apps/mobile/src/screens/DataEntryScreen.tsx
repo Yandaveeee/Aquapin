@@ -15,7 +15,7 @@ import {
 } from 'react-native';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
-import { Ionicons } from '@expo/vector-icons';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import {
   usePonds,
   useCreateMortalityLog,
@@ -218,10 +218,15 @@ function formatQuantity(value: number, unit: string): string {
   return `${value.toLocaleString()} ${unit}`;
 }
 
+type WorkspaceRow =
+  | { id: string; kind: 'group'; group: 'Today' | 'Yesterday' | 'Earlier'; count: number }
+  | { id: string; kind: 'entry'; entry: RecentEntry }
+  | { id: string; kind: 'history'; entry: HistoryRow };
+
 export default function DataEntryScreen() {
   const insets = useSafeAreaInsets();
   const { width } = useWindowDimensions();
-  const scrollViewRef = useRef<ScrollView>(null);
+  const scrollViewRef = useRef<FlatList<WorkspaceRow>>(null);
   const route = useRoute<any>();
   const navigation = useNavigation<any>();
   const isHistoryOnlyMode = route.params?.historyOnly === true;
@@ -231,9 +236,9 @@ export default function DataEntryScreen() {
   const activeModuleType = initialTypeParam || initialFilterTypeParam;
   const isSpecificModule = activeModuleType === 'stocking' || activeModuleType === 'harvest' || activeModuleType === 'mortality';
 
-  const [activeSegment, setActiveSegment] = useState<DataSegment>('log');
+  const [activeSegment, setActiveSegment] = useState<DataSegment>(() => isHistoryOnlyMode ? 'recent' : SEGMENTS.some(item => item.id === route.params?.initialSegment) ? route.params.initialSegment : 'log');
 
-  const [selectedType, setSelectedType] = useState<EntryType>('stocking');
+  const [selectedType, setSelectedType] = useState<EntryType>(() => ENTRY_TYPES.some(item => item.id === initialTypeParam) ? initialTypeParam! : 'stocking');
   const [selectedPondId, setSelectedPondId] = useState<string>('');
 
   const [quantity, setQuantity] = useState('');
@@ -245,15 +250,15 @@ export default function DataEntryScreen() {
   const [fishCount, setFishCount] = useState('');
 
   const [loading, setLoading] = useState(false);
+  const savingRef = useRef(false);
   const [showPondSelector, setShowPondSelector] = useState(false);
   const [showSpeciesSelector, setShowSpeciesSelector] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
   const [recentEntries, setRecentEntries] = useState<RecentEntry[]>([]);
-  const [recentLoading, setRecentLoading] = useState(true);
 
   const [filterPondId, setFilterPondId] = useState<string>('all');
-  const [filterType, setFilterType] = useState<EntryType | 'all'>('all');
+  const [filterType, setFilterType] = useState<EntryType | 'all'>(() => ENTRY_TYPES.some(item => item.id === initialFilterTypeParam) ? initialFilterTypeParam! : 'all');
   const [filterDate, setFilterDate] = useState<DateFilter>('all');
   const [filterStatus, setFilterStatus] = useState<FilterStatus>('all');
 
@@ -329,7 +334,7 @@ export default function DataEntryScreen() {
           .filter(Boolean)
       )
     );
-  }, [selectedPond, selectedType, stockings]);
+  }, [selectedPond?.isActive, selectedPond?.currentSpecies, selectedType, stockings]);
 
   const visibleSpeciesOptions = useMemo(() => {
     if (selectedType === 'harvest') {
@@ -405,11 +410,7 @@ export default function DataEntryScreen() {
     setSpecies((prev) => (prev === '' ? prev : ''));
   }, [harvestSpeciesOptions, selectedType]);
 
-  useEffect(() => {
-    setRecentLoading(true);
-    const timer = setTimeout(() => setRecentLoading(false), 550);
-    return () => clearTimeout(timer);
-  }, [activeSegment]);
+
 
   useEffect(() => {
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
@@ -474,8 +475,8 @@ export default function DataEntryScreen() {
       // Wait for keyboard animation, then move focused field into view.
       focusTimer.current = setTimeout(() => {
         const targetY = field === 'notes' ? (fieldLayouts.notes ?? y) : y;
-        scrollViewRef.current?.scrollTo({
-          y: Math.max(0, (targetY || 0) - 24),
+        scrollViewRef.current?.scrollToOffset({
+          offset: Math.max(0, (targetY || 0) - 24),
           animated: true,
         });
       }, Platform.OS === 'ios' ? 120 : 180);
@@ -495,6 +496,7 @@ export default function DataEntryScreen() {
 
   const submitEntry = useCallback(
     async (mode: 'save' | 'save_add') => {
+      if (savingRef.current) return;
       if (!user?.id) {
         showToast('error', 'You must be signed in to save entries.');
         return;
@@ -546,6 +548,7 @@ export default function DataEntryScreen() {
         return;
       }
 
+      savingRef.current = true;
       setLoading(true);
 
       try {
@@ -630,6 +633,7 @@ export default function DataEntryScreen() {
         setRecentEntries((prev) => [failedEntry, ...prev].slice(0, 250));
         showToast('error', message);
       } finally {
+        savingRef.current = false;
         setLoading(false);
       }
     },
@@ -1411,126 +1415,88 @@ export default function DataEntryScreen() {
     </View>
   );
 
-  const renderRecentSegment = () => (
-    <View>
-      {renderCompactFilters()}
+  const listRows = useMemo<WorkspaceRow[]>(() => {
+    if (visibleSegment === 'history') {
+      return !selectedPondId || isHistoryBusy ? [] : filteredHistoryRows.map(entry => ({ id: `history:${entry.id}`, kind: 'history', entry }));
+    }
+    if (visibleSegment === 'queue') {
+      return queueEntries.map(entry => ({ id: `queue:${entry.id}`, kind: 'entry', entry }));
+    }
+    if (visibleSegment !== 'recent') return [];
+    const rows: WorkspaceRow[] = [];
+    for (const group of ['Today', 'Yesterday', 'Earlier'] as const) {
+      const entries = groupedRecentEntries[group];
+      if (!entries.length) continue;
+      rows.push({ id: `group:${group}`, kind: 'group', group, count: entries.length });
+      if (collapsedGroups[group]) {
+        rows.push(...entries.map(entry => ({ id: `recent:${entry.id}`, kind: 'entry' as const, entry })));
+      }
+    }
+    return rows;
+  }, [visibleSegment, selectedPondId, isHistoryBusy, filteredHistoryRows, queueEntries, groupedRecentEntries, collapsedGroups]);
 
-      {recentLoading ? (
-        renderSkeletonList(4)
-      ) : (
-        <View>
-          {(['Today', 'Yesterday', 'Earlier'] as const).map((group) => {
-            const entries = groupedRecentEntries[group];
-            if (entries.length === 0) return null;
-
-            const expanded = collapsedGroups[group];
-
-            return (
-              <View key={group} style={styles.groupSection}>
-                <TouchableOpacity
-                  style={styles.groupHeader}
-                  onPress={() => setCollapsedGroups((prev) => ({ ...prev, [group]: !prev[group] }))}
-                >
-                  <Text style={styles.groupTitle}>{group}</Text>
-                  <View style={styles.groupCountWrap}>
-                    <Text style={styles.groupCountText}>{entries.length}</Text>
-                    <Ionicons name={expanded ? 'chevron-up' : 'chevron-down'} size={16} color="#667085" />
-                  </View>
-                </TouchableOpacity>
-
-                {expanded && entries.map((entry) => renderSwipeEntryRow(entry))}
-              </View>
-            );
-          })}
-
-          {filteredRecentEntries.length === 0 && (
-            <View style={styles.emptyState}>
-              <Ionicons name="time-outline" size={42} color="#c4c7cc" />
-              <Text style={styles.emptyStateText}>No recent entries</Text>
-              <Text style={styles.emptyStateSubtext}>Save a log entry to see it here.</Text>
-            </View>
-          )}
+  const renderTransactionRow = ({ item: row }: { item: WorkspaceRow }) => {
+    if (row.kind === 'entry') return renderSwipeEntryRow(row.entry);
+    if (row.kind === 'group') {
+      return (
+        <TouchableOpacity style={styles.groupHeader}
+          onPress={() => setCollapsedGroups(prev => ({ ...prev, [row.group]: !prev[row.group] }))}>
+          <Text style={styles.groupTitle}>{row.group}</Text>
+          <View style={styles.groupCountWrap}>
+            <Text style={styles.groupCountText}>{row.count}</Text>
+            <Ionicons name={collapsedGroups[row.group] ? 'chevron-up' : 'chevron-down'} size={16} color="#667085" />
+          </View>
+        </TouchableOpacity>
+      );
+    }
+    const item = row.entry;
+    const meta = getEntryTypeMeta(item.type);
+    return (
+      <View key={item.id} style={[styles.historyCard, { borderLeftColor: meta.color }]}>
+        <View style={[styles.historyIconContainer, { backgroundColor: `${meta.color}20` }]}>
+          <Ionicons name={meta.icon as any} size={16} color={meta.color} />
         </View>
-      )}
-    </View>
-  );
+        <View style={styles.historyInfo}>
+          <Text style={styles.historyTitle}>{item.title}</Text>
+          <Text style={styles.historySubtitle}>{item.subtitle}</Text>
+          <Text style={styles.historyDate}>{formatEventDate(item.createdAt)}</Text>
+        </View>
+        <View style={[styles.statusPill, item.status === 'active' ? styles.statusActiveLite : item.status === 'harvested' ? styles.statusHarvestedLite : styles.statusLoggedLite]}>
+          <Text style={styles.statusPillMiniText}>{item.status}</Text>
+        </View>
+      </View>
+    );
+  };
 
-  const renderHistorySegment = () => (
+  const renderListHeader = () => (
     <View>
       {renderCompactFilters()}
-
-      {!selectedPondId ? (
+      {visibleSegment === 'history' && !selectedPondId && (
         <View style={styles.emptyState}>
-          <Ionicons name="water-outline" size={42} color="#c4c7cc" />
           <Text style={styles.emptyStateText}>Pick a pond to view history</Text>
           <TouchableOpacity style={styles.pickPondButton} onPress={() => setShowPondSelector(true)}>
             <Text style={styles.pickPondButtonText}>Select Pond</Text>
           </TouchableOpacity>
         </View>
-      ) : isHistoryBusy ? (
-        renderSkeletonList(5)
-      ) : (
-        <View>
-          {filteredHistoryRows.map((item) => {
-            const meta = getEntryTypeMeta(item.type);
-            return (
-              <View key={item.id} style={[styles.historyCard, { borderLeftColor: meta.color }]}>
-                <View style={[styles.historyIconContainer, { backgroundColor: `${meta.color}20` }]}>
-                  <Ionicons name={meta.icon as any} size={16} color={meta.color} />
-                </View>
-                <View style={styles.historyInfo}>
-                  <Text style={styles.historyTitle}>{item.title}</Text>
-                  <Text style={styles.historySubtitle}>{item.subtitle}</Text>
-                  <Text style={styles.historyDate}>{formatEventDate(item.createdAt)}</Text>
-                </View>
-                <View style={[styles.statusPill, item.status === 'active' ? styles.statusActiveLite : item.status === 'harvested' ? styles.statusHarvestedLite : styles.statusLoggedLite]}>
-                  <Text style={styles.statusPillMiniText}>{item.status}</Text>
-                </View>
-              </View>
-            );
-          })}
-
-          {filteredHistoryRows.length === 0 && (
-            <View style={styles.emptyState}>
-              <Ionicons name="library-outline" size={42} color="#c4c7cc" />
-              <Text style={styles.emptyStateText}>No matching history</Text>
-              <Text style={styles.emptyStateSubtext}>Try another filter combination.</Text>
-            </View>
-          )}
+      )}
+      {visibleSegment === 'history' && selectedPondId && isHistoryBusy ? renderSkeletonList(5) : null}
+      {visibleSegment === 'queue' && (
+        <View style={styles.queueSummaryCard}>
+          <View>
+            <Text style={styles.queueSummaryTitle}>Sync Queue</Text>
+            <Text style={styles.queueSummarySub}>Local unresolved: {queuePendingCount}</Text>
+            <Text style={styles.queueSummarySub}>Last sync: {lastSync ? formatEventDate(lastSync.getTime()) : 'Never'}</Text>
+          </View>
+          <TouchableOpacity style={styles.queueSyncButton} onPress={handleRetrySync} disabled={isSyncing}>
+            {isSyncing ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.queueSyncButtonText}>Sync Now</Text>}
+          </TouchableOpacity>
         </View>
       )}
-    </View>
-  );
-
-  const renderQueueSegment = () => (
-    <View>
-      {renderCompactFilters()}
-
-      <View style={styles.queueSummaryCard}>
-        <View>
-          <Text style={styles.queueSummaryTitle}>Sync Queue</Text>
-          <Text style={styles.queueSummarySub}>Local unresolved: {queuePendingCount}</Text>
-          <Text style={styles.queueSummarySub}>Last sync: {lastSync ? formatEventDate(lastSync.getTime()) : 'Never'}</Text>
-        </View>
-
-        <TouchableOpacity style={styles.queueSyncButton} onPress={handleRetrySync} disabled={isSyncing}>
-          {isSyncing ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.queueSyncButtonText}>Sync Now</Text>}
-        </TouchableOpacity>
-      </View>
-
-      {recentLoading ? (
-        renderSkeletonList(3)
-      ) : (
-        <View>
-          {queueEntries.map((entry) => renderSwipeEntryRow(entry))}
-
-          {queueEntries.length === 0 && (
-            <View style={styles.emptyState}>
-              <Ionicons name="cloud-done-outline" size={42} color="#c4c7cc" />
-              <Text style={styles.emptyStateText}>Queue is clear</Text>
-              <Text style={styles.emptyStateSubtext}>No unsynced entries for current filters.</Text>
-            </View>
-          )}
+      {listRows.length === 0 && (visibleSegment !== 'history' || (selectedPondId && !isHistoryBusy)) && (
+        <View style={styles.emptyState}>
+          <Text style={styles.emptyStateText}>
+            {visibleSegment === 'recent' ? 'No recent entries' : visibleSegment === 'queue' ? 'Queue is clear' : 'No matching history'}
+          </Text>
         </View>
       )}
     </View>
@@ -1590,13 +1556,19 @@ export default function DataEntryScreen() {
         </View>
       )}
 
-      <ScrollView
+      <FlatList
         ref={scrollViewRef}
         style={styles.scrollView}
         contentContainerStyle={{ padding: 16, paddingBottom: contentBottomPadding }}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
-      >
+        data={listRows}
+        keyExtractor={item => item.id}
+        renderItem={renderTransactionRow}
+        initialNumToRender={12}
+        maxToRenderPerBatch={8}
+        windowSize={7}
+        ListHeaderComponent={<>
         <View style={styles.heroCard}>
           <View style={styles.heroTopRow}>
             <View style={[styles.heroBadge, { backgroundColor: `${workspaceAccentColor}18` }]}>
@@ -1641,10 +1613,9 @@ export default function DataEntryScreen() {
         </View>
 
         {visibleSegment === 'log' && renderLogSegment()}
-        {visibleSegment === 'recent' && renderRecentSegment()}
-        {visibleSegment === 'history' && renderHistorySegment()}
-        {visibleSegment === 'queue' && renderQueueSegment()}
-      </ScrollView>
+        {visibleSegment !== 'log' && renderListHeader()}
+        </>}
+      />
 
       {visibleSegment === 'log' && (
         <View style={[styles.stickyComposer, { bottom: composerBottom }]}>

@@ -17,6 +17,7 @@ export const CONFIG = {
   },
   ai: {
     groqApiKey: GROQ_API_KEY,
+    model: (process.env.EXPO_PUBLIC_GROQ_MODEL || '').trim() || 'openai/gpt-oss-20b',
   },
   mapsApiKey: MAPS_API_KEY,
 };

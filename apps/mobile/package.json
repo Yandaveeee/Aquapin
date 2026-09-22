@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "main": "index.ts",
   "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.cjs",
     "start": "expo start",
     "start:dev-client": "expo start --dev-client",
     "prebuild": "CI=1 expo prebuild --no-install",

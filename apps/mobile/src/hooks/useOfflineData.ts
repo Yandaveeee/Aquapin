@@ -1,8 +1,13 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { createContext, createElement, useContext, useEffect, useState, useCallback, useRef, ReactNode } from 'react';
+import { AppState } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+import { withLocalMutation } from '../db/localMutation';
+import { fetchPondRecords, watchLocalData } from '../db/queries';
+import { requestBackgroundSync, subscribeToSyncRequests, subscribeToSyncState } from '../db/syncEvents';
 import { database, mockDatabase } from '../db';
 import { Pond, MortalityLog, Harvest, StockingLog, PondHistory } from '../db/models';
 import { recomputePondState } from '../db/pondState';
-import { syncData, runSyncPreflight, SyncMetrics, SyncProgress } from '../db/sync';
+import { syncData, SyncMetrics, SyncProgress } from '../db/sync';
 import NetInfo from '@react-native-community/netinfo';
 import { isSupabaseConfigured, getSupabaseConfigError } from '../lib/supabase';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -25,7 +30,6 @@ const isMock = !database;
 const getCollection = (name: string) =>
   isMock ? (db.collections as any)[name] : db.collections.get(name);
 const LAST_SYNC_AT_KEY = '@aquapin_last_sync_at';
-const pondChangeListeners = new Set<() => void>();
 
 const EMPTY_QUEUE_SNAPSHOT: SyncQueueSnapshot = {
   items: [],
@@ -55,23 +59,6 @@ const EMPTY_QUEUE_SNAPSHOT: SyncQueueSnapshot = {
 
 function toId(value: any): string {
   return String(value || '').trim();
-}
-
-function notifyPondChange() {
-  pondChangeListeners.forEach((listener) => {
-    try {
-      listener();
-    } catch (error) {
-      console.warn('Pond change listener failed:', error);
-    }
-  });
-}
-
-function subscribeToPondChanges(listener: () => void) {
-  pondChangeListeners.add(listener);
-  return () => {
-    pondChangeListeners.delete(listener);
-  };
 }
 
 function hasSyncActivity(metrics: SyncMetrics): boolean {
@@ -109,34 +96,6 @@ async function enqueueCreateOperation(
   });
 }
 
-async function triggerImmediateSyncIfOnline(reason: string): Promise<void> {
-  if (!isSupabaseConfigured()) return;
-
-  try {
-    const [netInfo, settings] = await Promise.all([NetInfo.fetch(), loadSyncSettings()]);
-    const connected = !!netInfo.isConnected;
-    const reachable =
-      netInfo.isInternetReachable === null || netInfo.isInternetReachable === undefined
-        ? connected
-        : !!netInfo.isInternetReachable;
-    const wifi = netInfo.type === 'wifi';
-
-    if (!connected || !reachable) {
-      return;
-    }
-
-    if (settings.wifiOnly && !wifi) {
-      return;
-    }
-
-    await syncData().catch((error) => {
-      console.warn(`${reason} saved locally, but sync push failed:`, error);
-    });
-  } catch (error) {
-    console.warn(`${reason} saved locally, but online sync check failed:`, error);
-  }
-}
-
 async function createLocalPondHistoryRecord(data: {
   pondId: string;
   eventType: string;
@@ -167,7 +126,7 @@ async function createLocalPondHistoryRecord(data: {
 }
 
 async function markLocalStockingsHarvested(pondId: string, options: { queueUpdate?: boolean } = {}) {
-  const allStockings = await getCollection('stocking_logs').query().fetch();
+  const allStockings = await fetchPondRecords('stocking_logs', pondId);
   const activeStockings = allStockings.filter((stocking: any) => {
     return stocking.pondId === pondId && String(stocking.status || 'active').toLowerCase() !== 'harvested';
   });
@@ -209,6 +168,7 @@ async function markLocalStockingsHarvested(pondId: string, options: { queueUpdat
   const queuedUpdates: Array<{ localId: string; payload: Record<string, any> }> = [];
 
   await db.write(async () => {
+    const updates = [];
     for (const stocking of activeStockings as StockingLog[]) {
       const localId = toId((stocking as any)?.id);
       if (options.queueUpdate && localId) {
@@ -228,10 +188,11 @@ async function markLocalStockingsHarvested(pondId: string, options: { queueUpdat
         });
       }
 
-      await stocking.update((record: any) => {
+      updates.push(stocking.prepareUpdate((record: any) => {
         record.status = 'harvested';
-      });
+      }));
     }
+    await db.batch(...updates);
   });
 
   if (options.queueUpdate) {
@@ -247,70 +208,37 @@ async function markLocalStockingsHarvested(pondId: string, options: { queueUpdat
   }
 }
 
-// Hook to fetch all ponds
-export function usePonds() {
-  const [ponds, setPonds] = useState<Pond[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    let unmounted = false;
-    let mockInterval: ReturnType<typeof setInterval> | null = null;
-    let localSubscription: any = null;
-    let unsubscribePondChange: (() => void) | null = null;
-
-    const fetchPonds = async () => {
+// Update from durable local writes, without polling or waiting for the cloud.
+function useLocalRecords<T>(table: string, pondId?: string) {
+  const [state, setState] = useState<{ key: string; records: T[]; loading: boolean }>({
+    key: '', records: [], loading: true,
+  });
+  const key = `${table}:${pondId ?? '*'}`;
+  useFocusEffect(useCallback(() => {
+    let cancelled = false;
+    if (pondId === '') {
+      setState({ key, records: [], loading: false });
+      return;
+    }
+    const stop = watchLocalData([table], async () => {
       try {
-        const data = await getCollection('ponds').query().fetch();
-        if (!unmounted) {
-          setPonds(data);
-        }
+        const records = pondId === undefined
+          ? await getCollection(table).query().fetch()
+          : await fetchPondRecords(table, pondId);
+        if (pondId !== undefined) records.sort((a: any, b: any) => Number(b.createdAt) - Number(a.createdAt));
+        if (!cancelled) setState({ key, records: [...records], loading: false });
       } catch (error) {
-        console.error('Error fetching ponds:', error);
-        if (!unmounted) {
-          setPonds([]);
-        }
-      } finally {
-        if (!unmounted) {
-          setLoading(false);
-        }
+        console.error(`Error loading ${table}:`, error);
+        if (!cancelled) setState({ key, records: [], loading: false });
       }
-    };
-
-    fetchPonds();
-    unsubscribePondChange = subscribeToPondChanges(() => {
-      void fetchPonds();
     });
+    return () => { cancelled = true; stop(); };
+  }, [table, pondId, key]));
+  return state.key === key ? state : { records: [] as T[], loading: pondId !== '' };
+}
 
-    // For real WatermelonDB, subscribe to changes
-    if (!isMock) {
-      localSubscription = db.collections
-        .get('ponds')
-        .query()
-        .observe()
-        .subscribe((data: Pond[]) => {
-          setPonds(data);
-        });
-    }
-
-    // Mock mode fallback: refresh frequently for a near real-time list
-    if (isMock) {
-      mockInterval = setInterval(fetchPonds, 2000);
-    }
-
-    return () => {
-      unmounted = true;
-      if (localSubscription) {
-        localSubscription.unsubscribe();
-      }
-      if (unsubscribePondChange) {
-        unsubscribePondChange();
-      }
-      if (mockInterval) {
-        clearInterval(mockInterval);
-      }
-    };
-  }, []);
-
+export function usePonds() {
+  const { records: ponds, loading } = useLocalRecords<Pond>('ponds');
   return { ponds, loading };
 }
 
@@ -321,7 +249,7 @@ export function useCreatePond() {
     location: string; // GeoJSON Point string
     createdBy: string;
     boundary?: string; // JSON string of polygon coordinates
-  }) => {
+  }) => withLocalMutation(async () => {
     try {
       let createdPond: any
 
@@ -351,7 +279,6 @@ export function useCreatePond() {
       }
 
       const pondId = toId(createdPond?.id || createdPond?._raw?.id);
-      notifyPondChange();
       await enqueueCreateOperation(
         'ponds',
         pondId,
@@ -368,14 +295,14 @@ export function useCreatePond() {
         }
       );
 
-      await triggerImmediateSyncIfOnline('Create pond');
+      requestBackgroundSync();
 
       return createdPond;
     } catch (error) {
       console.error('Error creating pond:', error);
       throw error;
     }
-  }, []);
+  }), []);
 }
 
 // Hook to create mortality log (works offline)
@@ -385,7 +312,7 @@ export function useCreateMortalityLog() {
     quantity: number;
     notes?: string;
     loggedBy: string;
-  }) => {
+  }) => withLocalMutation(async () => {
     try {
       const createdAtTs = Date.now();
       const created = isMock
@@ -416,7 +343,6 @@ export function useCreateMortalityLog() {
       });
 
       await recomputePondState(data.pondId, { queueUpdate: true });
-      notifyPondChange();
 
       await enqueueCreateOperation('mortality_logs', toId((created as any)?.id || (created as any)?._raw?.id), {
         id: toId((created as any)?.id || (created as any)?._raw?.id),
@@ -436,14 +362,14 @@ export function useCreateMortalityLog() {
         createdAt: createdAtTs,
       }, data.pondId);
 
-      await triggerImmediateSyncIfOnline('Mortality report');
+      requestBackgroundSync();
 
       return created;
     } catch (error) {
       console.error('Error creating mortality log:', error);
       throw error;
     }
-  }, []);
+  }), []);
 }
 
 // Hook to create harvest (works offline)
@@ -455,7 +381,7 @@ export function useCreateHarvest() {
     species?: string;
     isPartial?: boolean;
     fishCount?: number;
-  }) => {
+  }) => withLocalMutation(async () => {
     try {
       const createdAtTs = Date.now();
       const created = isMock
@@ -499,7 +425,6 @@ export function useCreateHarvest() {
       });
 
       await recomputePondState(data.pondId, { queueUpdate: true });
-      notifyPondChange();
 
       await enqueueCreateOperation('harvests', toId((created as any)?.id || (created as any)?._raw?.id), {
         id: toId((created as any)?.id || (created as any)?._raw?.id),
@@ -526,14 +451,14 @@ export function useCreateHarvest() {
         createdAt: createdAtTs,
       }, data.pondId);
 
-      await triggerImmediateSyncIfOnline('Harvest');
+      requestBackgroundSync();
 
       return created;
     } catch (error) {
       console.error('Error creating harvest:', error);
       throw error;
     }
-  }, []);
+  }), []);
 }
 
 // Hook to create stocking log (works offline)
@@ -545,7 +470,7 @@ export function useCreateStockingLog() {
     averageWeightG?: number;
     source?: string;
     stockedBy: string;
-  }) => {
+  }) => withLocalMutation(async () => {
     try {
       const createdAtTs = Date.now();
       const created = isMock
@@ -587,7 +512,6 @@ export function useCreateStockingLog() {
       });
 
       await recomputePondState(data.pondId, { queueUpdate: true });
-      notifyPondChange();
 
       await enqueueCreateOperation('stocking_logs', toId((created as any)?.id || (created as any)?._raw?.id), {
         id: toId((created as any)?.id || (created as any)?._raw?.id),
@@ -615,14 +539,14 @@ export function useCreateStockingLog() {
         createdAt: createdAtTs,
       }, data.pondId);
 
-      await triggerImmediateSyncIfOnline('Stocking');
+      requestBackgroundSync();
 
       return created;
     } catch (error) {
       console.error('Error creating stocking log:', error);
       throw error;
     }
-  }, []);
+  }), []);
 }
 
 // Hook to create generic pond history events (feeding, sampling, treatment, etc.)
@@ -632,7 +556,7 @@ export function useCreatePondHistoryEvent() {
     eventType: string;
     eventData?: Record<string, any>;
     recordedBy: string;
-  }) => {
+  }) => withLocalMutation(async () => {
     try {
       const createdAtTs = Date.now();
       if (isMock) {
@@ -653,6 +577,7 @@ export function useCreatePondHistoryEvent() {
           createdAt: createdAtTs,
         }, data.pondId);
 
+        requestBackgroundSync();
         return created;
       }
 
@@ -676,306 +601,37 @@ export function useCreatePondHistoryEvent() {
         createdAt: createdAtTs,
       }, data.pondId);
 
-      await triggerImmediateSyncIfOnline(`Pond ${data.eventType}`);
-
+      requestBackgroundSync();
       return created;
     } catch (error) {
       console.error('Error creating pond history event:', error);
       throw error;
     }
-  }, []);
+  }), []);
 }
 
-// Helper function to update pond after stocking
-async function updatePondAfterStocking(pondId: string, species: string, quantity: number) {
-  try {
-    const allStockings = await getCollection('stocking_logs').query().fetch();
-    const pondStockings = allStockings.filter((s: any) => s.pondId === pondId && s.status === 'active');
-    const totalStock = pondStockings.reduce((sum: number, s: any) => sum + (s.quantity || 0), 0) + quantity;
-    
-    const allPonds = await getCollection('ponds').query().fetch();
-    const pond = allPonds.find((p: any) => p.id === pondId);
-    
-    if (pond && mockDatabase) {
-      await mockDatabase.set(`pond:${pondId}`, {
-        ...pond,
-        isActive: true,
-        currentSpecies: species,
-        currentStockCount: totalStock,
-      });
-    }
-  } catch (error) {
-    console.error('Error updating pond stock:', error);
-  }
-}
-
-// Helper function to update pond after harvest
-async function updatePondAfterHarvest(pondId: string, isPartial: boolean, fishCount?: number) {
-  try {
-    const allPonds = await getCollection('ponds').query().fetch();
-    const pond = allPonds.find((p: any) => p.id === pondId);
-    
-    if (!pond) return;
-    
-    if (isPartial && fishCount && pond.currentStockCount) {
-      const newCount = Math.max(0, pond.currentStockCount - fishCount);
-      await mockDatabase.set(`pond:${pondId}`, {
-        ...pond,
-        currentStockCount: newCount,
-      });
-    } else if (!isPartial) {
-      // Full harvest - pond is now inactive
-      await mockDatabase.set(`pond:${pondId}`, {
-        ...pond,
-        isActive: false,
-        currentStockCount: 0,
-        currentSpecies: undefined,
-      });
-      
-      // Mark all active stocking logs as harvested
-      const allStockings = await getCollection('stocking_logs').query().fetch();
-      const activeStockings = allStockings.filter((s: any) => s.pondId === pondId && s.status === 'active');
-      for (const stocking of activeStockings) {
-        await mockDatabase.set(`stocking:${stocking.id}`, { ...stocking, status: 'harvested' });
-      }
-    }
-  } catch (error) {
-    console.error('Error updating pond after harvest:', error);
-  }
-}
-
-// Helper function to update pond stock count after mortality
-async function updatePondStockCount(pondId: string) {
-  try {
-    // Calculate current stock based on stockings minus harvests and mortalities
-    const [stockings, harvests, mortalities] = await Promise.all([
-      getCollection('stocking_logs').query().fetch(),
-      getCollection('harvests').query().fetch(),
-      getCollection('mortality_logs').query().fetch(),
-    ]);
-    
-    const pondStockings = stockings.filter((s: any) => s.pondId === pondId && s.status === 'active');
-    const totalStocked = pondStockings.reduce((sum: number, s: any) => sum + (s.quantity || 0), 0);
-    
-    const pondHarvests = harvests.filter((h: any) => h.pondId === pondId);
-    const totalHarvested = pondHarvests.reduce((sum: number, h: any) => sum + (h.fishCount || 0), 0);
-    
-    const pondMortalities = mortalities.filter((m: any) => m.pondId === pondId);
-    const totalDead = pondMortalities.reduce((sum: number, m: any) => sum + (m.quantity || 0), 0);
-    
-    const currentStock = Math.max(0, totalStocked - totalHarvested - totalDead);
-    
-    const allPonds = await getCollection('ponds').query().fetch();
-    const pond = allPonds.find((p: any) => p.id === pondId);
-    
-    if (pond && mockDatabase) {
-      await mockDatabase.set(`pond:${pondId}`, {
-        ...pond,
-        currentStockCount: currentStock,
-        isActive: currentStock > 0,
-      });
-    }
-  } catch (error) {
-    console.error('Error updating pond stock count:', error);
-  }
-}
-
-// Hook to get mortality logs for a specific pond
 export function useMortalityLogs(pondId: string) {
-  const [logs, setLogs] = useState<MortalityLog[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const fetchLogs = async () => {
-      try {
-        const allLogs = await getCollection('mortality_logs').query().fetch();
-        const filtered = allLogs.filter((log: any) => log.pondId === pondId);
-        setLogs(filtered);
-      } catch (error) {
-        console.error('Error fetching mortality logs:', error);
-        setLogs([]);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchLogs();
-  }, [pondId]);
-
+  const { records: logs, loading } = useLocalRecords<MortalityLog>('mortality_logs', pondId);
   return { logs, loading };
 }
 
-// Hook to get harvests for a specific pond
 export function useHarvests(pondId: string) {
-  const [harvests, setHarvests] = useState<Harvest[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const fetchHarvests = async () => {
-      try {
-        const allHarvests = await getCollection('harvests').query().fetch();
-        const filtered = allHarvests.filter((h: any) => h.pondId === pondId);
-        setHarvests(filtered);
-      } catch (error) {
-        console.error('Error fetching harvests:', error);
-        setHarvests([]);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchHarvests();
-  }, [pondId]);
-
+  const { records: harvests, loading } = useLocalRecords<Harvest>('harvests', pondId);
   return { harvests, loading };
 }
 
-// Hook to get stocking logs for a specific pond
 export function useStockingLogs(pondId: string) {
-  const [stockings, setStockings] = useState<StockingLog[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!pondId) {
-      setStockings([]);
-      setLoading(false);
-      return;
-    }
-
-    let unmounted = false;
-    let mockInterval: ReturnType<typeof setInterval> | null = null;
-    let localSubscription: any = null;
-
-    const sortStockings = (items: StockingLog[]) => {
-      return [...items].sort((a: any, b: any) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
-    };
-
-    const fetchStockings = async () => {
-      try {
-        const allStockings = await getCollection('stocking_logs').query().fetch();
-        const filtered = allStockings.filter((s: any) => s.pondId === pondId) as StockingLog[];
-        if (!unmounted) {
-          setStockings(sortStockings(filtered));
-        }
-      } catch (error) {
-        console.error('Error fetching stocking logs:', error);
-        if (!unmounted) {
-          setStockings([]);
-        }
-      } finally {
-        if (!unmounted) {
-          setLoading(false);
-        }
-      }
-    };
-
-    fetchStockings();
-
-    if (!isMock) {
-      localSubscription = db.collections
-        .get('stocking_logs')
-        .query()
-        .observe()
-        .subscribe((allStockings: StockingLog[]) => {
-          const filtered = allStockings.filter((item: any) => item.pondId === pondId) as StockingLog[];
-          setStockings(sortStockings(filtered));
-          setLoading(false);
-        });
-    }
-
-    if (isMock) {
-      mockInterval = setInterval(fetchStockings, 2000);
-    }
-
-    return () => {
-      unmounted = true;
-      if (localSubscription) {
-        localSubscription.unsubscribe();
-      }
-      if (mockInterval) {
-        clearInterval(mockInterval);
-      }
-    };
-  }, [pondId]);
-
+  const { records: stockings, loading } = useLocalRecords<StockingLog>('stocking_logs', pondId);
   return { stockings, loading };
 }
 
-// Hook to get pond history (combined events)
 export function usePondHistory(pondId: string) {
-  const [history, setHistory] = useState<PondHistory[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    if (!pondId) {
-      setHistory([]);
-      setLoading(false);
-      return;
-    }
-
-    let unmounted = false;
-    let mockInterval: ReturnType<typeof setInterval> | null = null;
-    let localSubscription: any = null;
-
-    const sortHistory = (items: PondHistory[]) => {
-      return [...items].sort((a: any, b: any) => b.createdAt - a.createdAt);
-    };
-
-    const fetchHistory = async () => {
-      try {
-        const allHistory = await getCollection('pond_history').query().fetch();
-        const filtered = allHistory.filter((h: any) => h.pondId === pondId) as PondHistory[];
-        if (!unmounted) {
-          setHistory(sortHistory(filtered));
-        }
-      } catch (error) {
-        console.error('Error fetching pond history:', error);
-        if (!unmounted) {
-          setHistory([]);
-        }
-      } finally {
-        if (!unmounted) {
-          setLoading(false);
-        }
-      }
-    };
-
-    fetchHistory();
-
-    // Real WatermelonDB can observe collection updates in real-time
-    if (!isMock) {
-      localSubscription = db.collections
-        .get('pond_history')
-        .query()
-        .observe()
-        .subscribe((allEvents: PondHistory[]) => {
-          const filtered = allEvents.filter((event: any) => event.pondId === pondId) as PondHistory[];
-          setHistory(sortHistory(filtered));
-          setLoading(false);
-        });
-    }
-
-    // Mock mode fallback: periodic refresh
-    if (isMock) {
-      mockInterval = setInterval(fetchHistory, 2000);
-    }
-
-    return () => {
-      unmounted = true;
-      if (localSubscription) {
-        localSubscription.unsubscribe();
-      }
-      if (mockInterval) {
-        clearInterval(mockInterval);
-      }
-    };
-  }, [pondId]);
-
+  const { records: history, loading } = useLocalRecords<PondHistory>('pond_history', pondId);
   return { history, loading };
 }
 
 // Hook to handle sync with network status, queue, and policy controls
-export function useSync() {
+function useSyncState(enabled: boolean) {
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSync, setLastSync] = useState<Date | null>(null);
   const [lastPushAt, setLastPushState] = useState<Date | null>(null);
@@ -990,50 +646,72 @@ export function useSync() {
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [preflightBlockers, setPreflightBlockers] = useState<string[]>([]);
 
+  const syncInFlight = useRef(false);
+  const refreshAgain = useRef(false);
+  const refreshInFlight = useRef<Promise<void> | null>(null);
+  const [appActive, setAppActive] = useState(AppState.currentState === 'active');
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => setAppActive(state === 'active'));
+    return () => sub.remove();
+  }, []);
   const wasOnlineRef = useRef<boolean>(true);
 
-  const refreshSyncState = useCallback(async () => {
-    try {
-      const [snapshot, timestamps, settings, storedLastSync] = await Promise.all([
-        getSyncQueueSnapshot(120),
-        getSyncTimestamps(),
-        loadSyncSettings(),
-        AsyncStorage.getItem(LAST_SYNC_AT_KEY),
-      ]);
-
-      setQueueSnapshot(snapshot);
-      setSyncSettings(settings);
-
-      const pendingPonds = snapshot.pendingByEntity.ponds;
-      const pendingEntries =
-        snapshot.pendingByEntity.mortality_logs +
-        snapshot.pendingByEntity.harvests +
-        snapshot.pendingByEntity.stocking_logs +
-        snapshot.pendingByEntity.pond_history;
-
-      setPendingChanges({
-        ponds: pendingPonds,
-        entries: pendingEntries,
-      });
-
-      if (timestamps.lastPushAt) {
-        setLastPushState(new Date(timestamps.lastPushAt));
-      }
-      if (timestamps.lastPullAt) {
-        setLastPullState(new Date(timestamps.lastPullAt));
-      }
-
-      const historicalLastSync = storedLastSync ? Number(storedLastSync) : 0;
-      const maxSyncTs = Math.max(
-        timestamps.lastPushAt || 0,
-        timestamps.lastPullAt || 0,
-        Number.isFinite(historicalLastSync) ? historicalLastSync : 0
-      );
-      setLastSync(maxSyncTs > 0 ? new Date(maxSyncTs) : null);
-    } catch (error) {
-      console.error('Error refreshing sync state:', error);
+  const refreshSyncState = useCallback(async (): Promise<void> => {
+    if (!enabled) return;
+    if (refreshInFlight.current) {
+      refreshAgain.current = true;
+      return refreshInFlight.current;
     }
-  }, []);
+    refreshInFlight.current = (async () => {
+      try {
+        const [snapshot, timestamps, settings, storedLastSync] = await Promise.all([
+          getSyncQueueSnapshot(120),
+          getSyncTimestamps(),
+          loadSyncSettings(),
+          AsyncStorage.getItem(LAST_SYNC_AT_KEY),
+        ]);
+
+        setQueueSnapshot(snapshot);
+        setSyncSettings(settings);
+
+        const pendingPonds = snapshot.pendingByEntity.ponds;
+        const pendingEntries =
+          snapshot.pendingByEntity.mortality_logs +
+          snapshot.pendingByEntity.harvests +
+          snapshot.pendingByEntity.stocking_logs +
+          snapshot.pendingByEntity.pond_history;
+
+        setPendingChanges({
+          ponds: pendingPonds,
+          entries: pendingEntries,
+        });
+
+        if (timestamps.lastPushAt) {
+          setLastPushState(new Date(timestamps.lastPushAt));
+        }
+        if (timestamps.lastPullAt) {
+          setLastPullState(new Date(timestamps.lastPullAt));
+        }
+
+        const historicalLastSync = storedLastSync ? Number(storedLastSync) : 0;
+        const maxSyncTs = Math.max(
+          timestamps.lastPushAt || 0,
+          timestamps.lastPullAt || 0,
+          Number.isFinite(historicalLastSync) ? historicalLastSync : 0
+        );
+        setLastSync(maxSyncTs > 0 ? new Date(maxSyncTs) : null);
+      } catch (error) {
+        console.error('Error refreshing sync state:', error);
+      }
+    })().finally(() => {
+      refreshInFlight.current = null;
+      if (refreshAgain.current) {
+        refreshAgain.current = false;
+        void refreshSyncState();
+      }
+    });
+    return refreshInFlight.current;
+  }, [enabled]);
 
   const updateSyncSettings = useCallback(async (partial: Partial<SyncSettings>) => {
     const next = await saveSyncSettings(partial);
@@ -1059,45 +737,41 @@ export function useSync() {
   }, [refreshSyncState]);
 
   const performSync = useCallback(async (showSuccess = false) => {
-    if (isSyncing) {
+    if (!enabled || syncInFlight.current) {
       return { success: false, message: 'Sync already in progress.' };
     }
 
-    const netInfo = await NetInfo.fetch();
-    const connected = !!netInfo.isConnected;
-    const reachable = netInfo.isInternetReachable === null ? connected : !!netInfo.isInternetReachable;
-    const wifi = netInfo.type === 'wifi';
-
-    setIsOnline(connected && reachable);
-    setIsInternetReachable(reachable);
-    setIsWifi(wifi);
-
-    if (!connected || !reachable) {
-      return { success: false, message: 'No internet connection' };
-    }
-
-    if (syncSettings.wifiOnly && !wifi) {
-      return { success: false, message: 'Sync is set to Wi-Fi only. Connect to Wi-Fi to continue.' };
-    }
-
-    if (!isSupabaseConfigured()) {
-      return {
-        success: false,
-        message: getSupabaseConfigError() || 'Supabase is not configured.',
-      };
-    }
-
-    const preflight = await runSyncPreflight();
-    setPreflightBlockers(preflight.blockers);
-    if (!preflight.ok) {
-      return { success: false, message: preflight.blockers[0] || 'Sync preflight failed.' };
-    }
-
+    syncInFlight.current = true;
     setIsSyncing(true);
-    setSyncMessage('Syncing...');
-    setSyncProgress(null);
-
     try {
+      const netInfo = await NetInfo.fetch();
+      const connected = !!netInfo.isConnected;
+      const reachable = netInfo.isInternetReachable === null ? connected : !!netInfo.isInternetReachable;
+      const wifi = netInfo.type === 'wifi';
+
+      setIsOnline(connected && reachable);
+      setIsInternetReachable(reachable);
+      setIsWifi(wifi);
+
+      if (!connected || !reachable) {
+        return { success: false, message: 'No internet connection' };
+      }
+
+      if (syncSettings.wifiOnly && !wifi) {
+        return { success: false, message: 'Sync is set to Wi-Fi only. Connect to Wi-Fi to continue.' };
+      }
+
+      if (!isSupabaseConfigured()) {
+        return {
+          success: false,
+          message: getSupabaseConfigError() || 'Supabase is not configured.',
+        };
+      }
+
+      setPreflightBlockers([]);
+      setSyncMessage('Syncing...');
+      setSyncProgress(null);
+
       const metrics = await syncData({
         onProgress: (progress) => {
           setSyncProgress(progress);
@@ -1122,12 +796,14 @@ export function useSync() {
           ? error.message
           : 'Sync failed. Will retry automatically.';
       setSyncMessage(message);
+      setPreflightBlockers([message]);
       await refreshSyncState();
       return { success: false, message };
     } finally {
+      syncInFlight.current = false;
       setIsSyncing(false);
     }
-  }, [isSyncing, refreshSyncState, syncSettings.wifiOnly]);
+  }, [enabled, refreshSyncState, syncSettings.wifiOnly]);
 
   // Monitor network status with reachability and network type.
   useEffect(() => {
@@ -1154,18 +830,18 @@ export function useSync() {
     wasOnlineRef.current = isOnline;
 
     if (!cameOnline) return;
-    if (!syncSettings.autoSync) return;
+    if (!enabled || !appActive || !syncSettings.autoSync) return;
     if (syncSettings.wifiOnly && !isWifi) return;
 
     const timer = setTimeout(() => {
       void performSync(false);
     }, 1000);
     return () => clearTimeout(timer);
-  }, [isOnline, isWifi, performSync, syncSettings.autoSync, syncSettings.wifiOnly]);
+  }, [enabled, appActive, isOnline, isWifi, performSync, syncSettings.autoSync, syncSettings.wifiOnly]);
 
   // Background periodic auto-sync loop.
   useEffect(() => {
-    if (!syncSettings.autoSync) return;
+    if (!enabled || !appActive || !syncSettings.autoSync) return;
     if (!isOnline) return;
     if (syncSettings.wifiOnly && !isWifi) return;
 
@@ -1178,6 +854,8 @@ export function useSync() {
 
     return () => clearInterval(interval);
   }, [
+    enabled,
+    appActive,
     isOnline,
     isSyncing,
     isWifi,
@@ -1187,13 +865,39 @@ export function useSync() {
     syncSettings.wifiOnly,
   ]);
 
-  // Keep queue/pending state fresh even when user doesn't open Sync tab.
+  // One shared listener replaces each mounted screen's queue polling loop.
   useEffect(() => {
-    const interval = setInterval(() => {
-      void refreshSyncState();
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [refreshSyncState]);
+    if (!enabled) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const unsubscribe = subscribeToSyncState(() => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { void refreshSyncState(); }, 50);
+    });
+    return () => { clearTimeout(timer); unsubscribe(); };
+  }, [enabled, refreshSyncState]);
+
+  useEffect(() => {
+    if (!enabled || !appActive || !syncSettings.autoSync) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pending = false;
+    let cancelled = false;
+    const run = async () => {
+      if (cancelled) return;
+      if (syncInFlight.current) {
+        timer = setTimeout(() => { void run(); }, 500);
+        return;
+      }
+      pending = false;
+      await performSync(false);
+      if (pending && !cancelled) timer = setTimeout(() => { void run(); }, 250);
+    };
+    const unsubscribe = subscribeToSyncRequests(() => {
+      pending = true;
+      clearTimeout(timer);
+      timer = setTimeout(() => { void run(); }, 250);
+    });
+    return () => { cancelled = true; clearTimeout(timer); unsubscribe(); };
+  }, [enabled, appActive, performSync, syncSettings.autoSync]);
 
   return {
     isSyncing,
@@ -1215,4 +919,17 @@ export function useSync() {
     retrySyncItem,
     retryAllFailed,
   };
+}
+
+const SyncContext = createContext<ReturnType<typeof useSyncState> | null>(null);
+
+export function SyncProvider({ children, enabled = true }: { children: ReactNode; enabled?: boolean }) {
+  const value = useSyncState(enabled);
+  return createElement(SyncContext.Provider, { value }, children);
+}
+
+export function useSync() {
+  const value = useContext(SyncContext);
+  if (!value) throw new Error('useSync requires SyncProvider');
+  return value;
 }

@@ -8,6 +8,7 @@ import {
 import {
   appendConflictLog,
   clearSyncRuntimeState,
+  commitSyncResult,
   enqueueSyncOperation,
   getSyncQueueSnapshot,
   getSyncTimestamps,
@@ -22,6 +23,7 @@ import {
   SyncQueueItem,
 } from './syncQueue'
 import { recomputeAllPondStates } from './pondState'
+import { withLocalMutation } from './localMutation'
 
 export { isSupabaseConfigured } from '../lib/supabase'
 
@@ -361,6 +363,14 @@ async function loadMarkerMap(entity: SyncEntity): Promise<Map<string, string>> {
 async function setMarker(entity: SyncEntity, localId: string, remoteId: string): Promise<void> {
   if (!localId || !remoteId) return
   await AsyncStorage.setItem(getMarkerKey(entity, localId), remoteId)
+}
+
+async function setMarkers(markers: Array<{ entity: SyncEntity; localId: string; remoteId: string }>): Promise<void> {
+  const pairs = new Map<string, string>()
+  for (const { entity, localId, remoteId } of markers) {
+    if (localId && remoteId) pairs.set(getMarkerKey(entity, localId), remoteId)
+  }
+  if (pairs.size > 0) await AsyncStorage.multiSet([...pairs.entries()])
 }
 
 async function removeMarker(entity: SyncEntity, localId: string): Promise<void> {
@@ -961,6 +971,12 @@ async function processSingleQueueItem(
         throw error
       }
 
+      // RLS can hide the target row without returning a database error.
+      // Keep the operation retryable instead of discarding an unsaved update.
+      if (!data?.id) {
+        throw new Error(`Cannot update ${processingItem.entity}: row missing or update permission denied`)
+      }
+
       responseData = data
     } else {
       const useUpsert = Boolean(preferredId)
@@ -1244,22 +1260,16 @@ async function syncMockQueueToSupabase(
     const createItems = itemsForEntity.filter((item) => item.operation === 'create')
     const nonCreateItems = itemsForEntity.filter((item) => item.operation !== 'create')
 
-    if (createItems.length > 0) {
-      for (const item of createItems) {
-        const result = await processSingleQueueItem(queue, item, userId, pondMaps, metrics)
-        queue = result.queue
-        await saveSyncQueue(queue)
-      }
-    }
-
-    for (const item of nonCreateItems) {
+    for (const queuedItem of [...createItems, ...nonCreateItems]) {
+      queue = await loadSyncQueue()
+      const item = queue.find(entry => entry.id === queuedItem.id)
+      if (!item || !isQueueItemReadyForRetry(item)) continue
       const result = await processSingleQueueItem(queue, item, userId, pondMaps, metrics)
-      queue = result.queue
-      await saveSyncQueue(queue)
+      const processed = result.queue.find(entry => entry.id === item.id)
+      if (processed) await commitSyncResult(item, processed)
     }
   }
-
-  await saveSyncQueue(queue)
+  queue = await loadSyncQueue()
 
   const hasPushes = Object.values(metrics.pushed).some((value) => value > 0)
   if (hasPushes) {
@@ -1344,6 +1354,7 @@ async function prepareWatermelonUpsert(
   const { prepareCreateFromRaw, prepareUpdateFromRaw } = require('@nozbe/watermelondb/sync/impl/helpers')
 
   if (existingRecord?._raw) {
+    if (Object.keys(dirtyRaw).every(key => existingRecord._raw[key] === dirtyRaw[key])) return null
     return prepareUpdateFromRaw(existingRecord._raw, dirtyRaw, collection, false)
   }
 
@@ -1439,273 +1450,303 @@ async function syncSupabaseToWatermelon(
     pullSupabaseTableSince('pond_history', sinceIso, userId, scopeToUser),
   ])
 
-  const pondMaps = await loadPondIdMaps()
+  return withLocalMutation(async () => {
+    const pendingRecords = new Set((await loadSyncQueue())
+      .filter(item => item.status !== 'synced')
+      .map(item => `${item.entity}:${item.localId}`))
+    const pondMaps = await loadPondIdMaps()
 
-  const pondsCollection = database.collections.get('ponds')
-  const mortalityCollection = database.collections.get('mortality_logs')
-  const harvestCollection = database.collections.get('harvests')
-  const stockingCollection = database.collections.get('stocking_logs')
-  const historyCollection = database.collections.get('pond_history')
+    const pondsCollection = database.collections.get('ponds')
+    const mortalityCollection = database.collections.get('mortality_logs')
+    const harvestCollection = database.collections.get('harvests')
+    const stockingCollection = database.collections.get('stocking_logs')
+    const historyCollection = database.collections.get('pond_history')
 
-  let [localPonds, localMortalities, localHarvests, localStockings, localHistory] = await Promise.all([
-    pondsCollection.query().fetch(),
-    mortalityCollection.query().fetch(),
-    harvestCollection.query().fetch(),
-    stockingCollection.query().fetch(),
-    historyCollection.query().fetch(),
-  ])
+    let [localPonds, localMortalities, localHarvests, localStockings, localHistory] = await Promise.all([
+      pondsCollection.query().fetch(),
+      mortalityCollection.query().fetch(),
+      harvestCollection.query().fetch(),
+      stockingCollection.query().fetch(),
+      historyCollection.query().fetch(),
+    ])
 
-  if (scopeToUser) {
-    const removed = await removeOutOfScopeWatermelonRecords(
-      userId,
-      {
-        localPonds,
-        localMortalities,
-        localHarvests,
-        localStockings,
-        localHistory,
+    if (scopeToUser) {
+      const removed = await removeOutOfScopeWatermelonRecords(
+        userId,
+        {
+          localPonds,
+          localMortalities,
+          localHarvests,
+          localStockings,
+          localHistory,
+        }
+      )
+
+      if (removed > 0) {
+        metrics.skipped += removed
+        const nextLocalRecords = await Promise.all([
+          pondsCollection.query().fetch(),
+          mortalityCollection.query().fetch(),
+          harvestCollection.query().fetch(),
+          stockingCollection.query().fetch(),
+          historyCollection.query().fetch(),
+        ])
+        localPonds = nextLocalRecords[0]
+        localMortalities = nextLocalRecords[1]
+        localHarvests = nextLocalRecords[2]
+        localStockings = nextLocalRecords[3]
+        localHistory = nextLocalRecords[4]
       }
-    )
-
-    if (removed > 0) {
-      metrics.skipped += removed
-      const nextLocalRecords = await Promise.all([
-        pondsCollection.query().fetch(),
-        mortalityCollection.query().fetch(),
-        harvestCollection.query().fetch(),
-        stockingCollection.query().fetch(),
-        historyCollection.query().fetch(),
-      ])
-      localPonds = nextLocalRecords[0]
-      localMortalities = nextLocalRecords[1]
-      localHarvests = nextLocalRecords[2]
-      localStockings = nextLocalRecords[3]
-      localHistory = nextLocalRecords[4]
     }
-  }
 
-  const pondById = new Map(localPonds.map((item: any) => [toId(item?.id), item]))
-  const mortalityById = new Map(localMortalities.map((item: any) => [toId(item?.id), item]))
-  const harvestById = new Map(localHarvests.map((item: any) => [toId(item?.id), item]))
-  const stockingById = new Map(localStockings.map((item: any) => [toId(item?.id), item]))
-  const historyById = new Map(localHistory.map((item: any) => [toId(item?.id), item]))
+    const pondById = new Map(localPonds.map((item: any) => [toId(item?.id), item]))
+    const mortalityById = new Map(localMortalities.map((item: any) => [toId(item?.id), item]))
+    const harvestById = new Map(localHarvests.map((item: any) => [toId(item?.id), item]))
+    const stockingById = new Map(localStockings.map((item: any) => [toId(item?.id), item]))
+    const historyById = new Map(localHistory.map((item: any) => [toId(item?.id), item]))
 
-  const localPondBySignature = new Map<string, any>()
-  for (const pond of localPonds as any[]) {
-    const signature = pondSyncSignature(
-      pond.name,
-      pond.createdBy || pond.created_by,
-      pond.createdAt || pond.created_at
-    )
-    localPondBySignature.set(signature, pond)
-  }
+    const localPondBySignature = new Map<string, any>()
+    for (const pond of localPonds as any[]) {
+      const signature = pondSyncSignature(
+        pond.name,
+        pond.createdBy || pond.created_by,
+        pond.createdAt || pond.created_at
+      )
+      localPondBySignature.set(signature, pond)
+    }
 
-  const operations: any[] = []
-  const markerWrites: Array<{ entity: SyncEntity; localId: string; remoteId: string }> = []
-  const seenPondLocalIds = new Set<string>()
+    const operations: any[] = []
+    const markerWrites: Array<{ entity: SyncEntity; localId: string; remoteId: string }> = []
+    const seenPondLocalIds = new Set<string>()
 
-  for (const row of ponds) {
-    const remoteId = safeText(row.id).trim()
-    if (!remoteId) continue
+    for (const row of ponds) {
+      const remoteId = safeText(row.id).trim()
+      if (!remoteId) continue
 
-    const signature = pondSyncSignature(row.name, row.created_by || row.createdBy, row.created_at || row.createdAt)
-    const matchedLocal =
-      pondById.get(pondMaps.remoteToLocal.get(remoteId) || '') ||
-      localPondBySignature.get(signature) ||
-      pondById.get(remoteId)
+      const signature = pondSyncSignature(row.name, row.created_by || row.createdBy, row.created_at || row.createdAt)
+      const matchedLocal =
+        pondById.get(pondMaps.remoteToLocal.get(remoteId) || '') ||
+        localPondBySignature.get(signature) ||
+        pondById.get(remoteId)
 
-    const localId = toId(matchedLocal?.id || remoteId)
-    if (!localId) continue
+      const localId = toId(matchedLocal?.id || remoteId)
+      if (!localId) continue
 
-    if (seenPondLocalIds.has(localId)) {
-      console.warn(`Skipping duplicate pond pull for local id "${localId}" while processing remote pond "${remoteId}".`)
+      if (seenPondLocalIds.has(localId)) {
+        console.warn(`Skipping duplicate pond pull for local id "${localId}" while processing remote pond "${remoteId}".`)
+        pondMaps.remoteToLocal.set(remoteId, localId)
+        markerWrites.push({ entity: 'ponds', localId, remoteId })
+        continue
+      }
+
+      if (pendingRecords.has(`ponds:${localId}`)) {
+        pondMaps.localToRemote.set(localId, remoteId)
+        pondMaps.remoteToLocal.set(remoteId, localId)
+        markerWrites.push({ entity: 'ponds', localId, remoteId })
+        continue
+      }
+
+      seenPondLocalIds.add(localId)
+
+      const dirtyRaw = makeSyncedDirtyRaw(localId, {
+        name: row.name || 'Unnamed Pond',
+        location: normalizeLocation(row.location),
+        boundary: row.boundary ?? null,
+        created_by: row.created_by || row.createdBy || '',
+        created_at: toTimestamp(row.created_at || row.createdAt),
+        is_active: Boolean(row.is_active ?? row.isActive),
+        current_species: row.current_species ?? row.currentSpecies ?? null,
+        current_stock_count: Math.max(0, Math.round(toFiniteNumber(row.current_stock_count ?? row.currentStockCount, 0))),
+      })
+
+      const prepared = await prepareWatermelonUpsert(pondsCollection, matchedLocal, dirtyRaw)
+      if (prepared) {
+        operations.push(prepared)
+      }
+
+      const signatureRecord = {
+        id: localId,
+        name: dirtyRaw.name,
+        createdBy: dirtyRaw.created_by,
+        createdAt: dirtyRaw.created_at,
+      }
+      pondById.set(localId, matchedLocal || signatureRecord)
+      localPondBySignature.set(signature, signatureRecord)
+      pondMaps.localToRemote.set(localId, remoteId)
       pondMaps.remoteToLocal.set(remoteId, localId)
       markerWrites.push({ entity: 'ponds', localId, remoteId })
-      continue
     }
 
-    seenPondLocalIds.add(localId)
-
-    const dirtyRaw = makeSyncedDirtyRaw(localId, {
-      name: row.name || 'Unnamed Pond',
-      location: normalizeLocation(row.location),
-      boundary: row.boundary ?? null,
-      created_by: row.created_by || row.createdBy || '',
-      created_at: toTimestamp(row.created_at || row.createdAt),
-      is_active: Boolean(row.is_active ?? row.isActive),
-      current_species: row.current_species ?? row.currentSpecies ?? null,
-      current_stock_count: Math.max(0, Math.round(toFiniteNumber(row.current_stock_count ?? row.currentStockCount, 0))),
-    })
-
-    const prepared = await prepareWatermelonUpsert(pondsCollection, matchedLocal, dirtyRaw)
-    if (prepared) {
-      operations.push(prepared)
+    const mortalityMarkerMap = await loadMarkerMap('mortality_logs')
+    const mortalityRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of mortalityMarkerMap.entries()) {
+      mortalityRemoteToLocal.set(remoteId, localId)
     }
 
-    const signatureRecord = {
-      id: localId,
-      name: dirtyRaw.name,
-      createdBy: dirtyRaw.created_by,
-      createdAt: dirtyRaw.created_at,
-    }
-    pondById.set(localId, matchedLocal || signatureRecord)
-    localPondBySignature.set(signature, signatureRecord)
-    pondMaps.localToRemote.set(localId, remoteId)
-    pondMaps.remoteToLocal.set(remoteId, localId)
-    markerWrites.push({ entity: 'ponds', localId, remoteId })
-  }
+    for (const row of mortalities) {
+      const remoteId = safeText(row.id).trim()
+      if (!remoteId) continue
 
-  const mortalityMarkerMap = await loadMarkerMap('mortality_logs')
-  const mortalityRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of mortalityMarkerMap.entries()) {
-    mortalityRemoteToLocal.set(remoteId, localId)
-  }
+      const localId = mortalityRemoteToLocal.get(remoteId) || remoteId
+      if (pendingRecords.has(`mortality_logs:${localId}`)) {
+        markerWrites.push({ entity: 'mortality_logs', localId, remoteId })
+        continue
+      }
 
-  for (const row of mortalities) {
-    const remoteId = safeText(row.id).trim()
-    if (!remoteId) continue
+      const existing = mortalityById.get(localId)
+      const dirtyRaw = makeSyncedDirtyRaw(localId, {
+        pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
+        quantity: Number(row.quantity || 0),
+        notes: row.notes ?? null,
+        logged_by: String(row.logged_by || row.loggedBy || ''),
+        created_at: toTimestamp(row.created_at || row.createdAt),
+      })
 
-    const localId = mortalityRemoteToLocal.get(remoteId) || remoteId
-    const existing = mortalityById.get(localId)
-    const dirtyRaw = makeSyncedDirtyRaw(localId, {
-      pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
-      quantity: Number(row.quantity || 0),
-      notes: row.notes ?? null,
-      logged_by: String(row.logged_by || row.loggedBy || ''),
-      created_at: toTimestamp(row.created_at || row.createdAt),
-    })
+      const prepared = await prepareWatermelonUpsert(mortalityCollection, existing, dirtyRaw)
+      if (prepared) {
+        operations.push(prepared)
+      }
 
-    const prepared = await prepareWatermelonUpsert(mortalityCollection, existing, dirtyRaw)
-    if (prepared) {
-      operations.push(prepared)
+      mortalityById.set(localId, existing || { id: localId })
+      markerWrites.push({ entity: 'mortality_logs', localId, remoteId })
     }
 
-    mortalityById.set(localId, existing || { id: localId })
-    markerWrites.push({ entity: 'mortality_logs', localId, remoteId })
-  }
-
-  const harvestMarkerMap = await loadMarkerMap('harvests')
-  const harvestRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of harvestMarkerMap.entries()) {
-    harvestRemoteToLocal.set(remoteId, localId)
-  }
-
-  for (const row of harvests) {
-    const remoteId = safeText(row.id).trim()
-    if (!remoteId) continue
-
-    const localId = harvestRemoteToLocal.get(remoteId) || remoteId
-    const existing = harvestById.get(localId)
-    const dirtyRaw = makeSyncedDirtyRaw(localId, {
-      pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
-      yield_kg: Number(row.yield_kg ?? row.yieldKg ?? 0),
-      harvested_by: String(row.harvested_by || row.harvestedBy || ''),
-      created_at: toTimestamp(row.created_at || row.createdAt),
-      species: row.species ?? null,
-      is_partial: Boolean(row.is_partial ?? row.isPartial),
-      fish_count:
-        row.fish_count === null || row.fish_count === undefined
-          ? null
-          : Math.max(0, Math.round(toFiniteNumber(row.fish_count ?? row.fishCount, 0))),
-    })
-
-    const prepared = await prepareWatermelonUpsert(harvestCollection, existing, dirtyRaw)
-    if (prepared) {
-      operations.push(prepared)
+    const harvestMarkerMap = await loadMarkerMap('harvests')
+    const harvestRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of harvestMarkerMap.entries()) {
+      harvestRemoteToLocal.set(remoteId, localId)
     }
 
-    harvestById.set(localId, existing || { id: localId })
-    markerWrites.push({ entity: 'harvests', localId, remoteId })
-  }
+    for (const row of harvests) {
+      const remoteId = safeText(row.id).trim()
+      if (!remoteId) continue
 
-  const stockingMarkerMap = await loadMarkerMap('stocking_logs')
-  const stockingRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of stockingMarkerMap.entries()) {
-    stockingRemoteToLocal.set(remoteId, localId)
-  }
+      const localId = harvestRemoteToLocal.get(remoteId) || remoteId
+      if (pendingRecords.has(`harvests:${localId}`)) {
+        markerWrites.push({ entity: 'harvests', localId, remoteId })
+        continue
+      }
 
-  for (const row of stockings) {
-    const remoteId = safeText(row.id).trim()
-    if (!remoteId) continue
+      const existing = harvestById.get(localId)
+      const dirtyRaw = makeSyncedDirtyRaw(localId, {
+        pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
+        yield_kg: Number(row.yield_kg ?? row.yieldKg ?? 0),
+        harvested_by: String(row.harvested_by || row.harvestedBy || ''),
+        created_at: toTimestamp(row.created_at || row.createdAt),
+        species: row.species ?? null,
+        is_partial: Boolean(row.is_partial ?? row.isPartial),
+        fish_count:
+          row.fish_count === null || row.fish_count === undefined
+            ? null
+            : Math.max(0, Math.round(toFiniteNumber(row.fish_count ?? row.fishCount, 0))),
+      })
 
-    const localId = stockingRemoteToLocal.get(remoteId) || remoteId
-    const existing = stockingById.get(localId)
-    const dirtyRaw = makeSyncedDirtyRaw(localId, {
-      pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
-      species: row.species || '',
-      quantity: Number(row.quantity || 0),
-      average_weight_g:
-        row.average_weight_g === null || row.average_weight_g === undefined
-          ? null
-          : toFiniteNumber(row.average_weight_g ?? row.averageWeightG, 0),
-      source: row.source ?? null,
-      stocked_by: String(row.stocked_by || row.stockedBy || ''),
-      created_at: toTimestamp(row.created_at || row.createdAt),
-      status: row.status || 'active',
-    })
+      const prepared = await prepareWatermelonUpsert(harvestCollection, existing, dirtyRaw)
+      if (prepared) {
+        operations.push(prepared)
+      }
 
-    const prepared = await prepareWatermelonUpsert(stockingCollection, existing, dirtyRaw)
-    if (prepared) {
-      operations.push(prepared)
+      harvestById.set(localId, existing || { id: localId })
+      markerWrites.push({ entity: 'harvests', localId, remoteId })
     }
 
-    stockingById.set(localId, existing || { id: localId })
-    markerWrites.push({ entity: 'stocking_logs', localId, remoteId })
-  }
-
-  const historyMarkerMap = await loadMarkerMap('pond_history')
-  const historyRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of historyMarkerMap.entries()) {
-    historyRemoteToLocal.set(remoteId, localId)
-  }
-
-  for (const row of history) {
-    const remoteId = safeText(row.id).trim()
-    if (!remoteId) continue
-
-    const localId = historyRemoteToLocal.get(remoteId) || remoteId
-    const existing = historyById.get(localId)
-    const dirtyRaw = makeSyncedDirtyRaw(localId, {
-      pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
-      event_type: row.event_type || row.eventType || '',
-      event_data:
-        typeof row.event_data === 'string'
-          ? row.event_data
-          : JSON.stringify(row.event_data || row.eventData || {}),
-      created_at: toTimestamp(row.created_at || row.createdAt),
-      recorded_by: String(row.recorded_by || row.recordedBy || ''),
-    })
-
-    const prepared = await prepareWatermelonUpsert(historyCollection, existing, dirtyRaw)
-    if (prepared) {
-      operations.push(prepared)
+    const stockingMarkerMap = await loadMarkerMap('stocking_logs')
+    const stockingRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of stockingMarkerMap.entries()) {
+      stockingRemoteToLocal.set(remoteId, localId)
     }
 
-    historyById.set(localId, existing || { id: localId })
-    markerWrites.push({ entity: 'pond_history', localId, remoteId })
-  }
+    for (const row of stockings) {
+      const remoteId = safeText(row.id).trim()
+      if (!remoteId) continue
 
-  if (operations.length > 0) {
-    await database.write(async () => {
-      await (database as any).batch(...operations)
-    })
-  }
+      const localId = stockingRemoteToLocal.get(remoteId) || remoteId
+      if (pendingRecords.has(`stocking_logs:${localId}`)) {
+        markerWrites.push({ entity: 'stocking_logs', localId, remoteId })
+        continue
+      }
 
-  for (const marker of markerWrites) {
-    await setMarker(marker.entity, marker.localId, marker.remoteId)
-  }
+      const existing = stockingById.get(localId)
+      const dirtyRaw = makeSyncedDirtyRaw(localId, {
+        pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
+        species: row.species || '',
+        quantity: Number(row.quantity || 0),
+        average_weight_g:
+          row.average_weight_g === null || row.average_weight_g === undefined
+            ? null
+            : toFiniteNumber(row.average_weight_g ?? row.averageWeightG, 0),
+        source: row.source ?? null,
+        stocked_by: String(row.stocked_by || row.stockedBy || ''),
+        created_at: toTimestamp(row.created_at || row.createdAt),
+        status: row.status || 'active',
+      })
 
-  metrics.pulled.ponds += ponds.length
-  metrics.pulled.mortality_logs += mortalities.length
-  metrics.pulled.harvests += harvests.length
-  metrics.pulled.stocking_logs += stockings.length
-  metrics.pulled.pond_history += history.length
+      const prepared = await prepareWatermelonUpsert(stockingCollection, existing, dirtyRaw)
+      if (prepared) {
+        operations.push(prepared)
+      }
 
-  await setLastPullAt(Date.now())
+      stockingById.set(localId, existing || { id: localId })
+      markerWrites.push({ entity: 'stocking_logs', localId, remoteId })
+    }
 
-  console.log(
-    `✅ Pulled ${ponds.length} ponds, ${mortalities.length} mortality logs, ${harvests.length} harvests, ${stockings.length} stockings, ${history.length} history records`
-  )
+    const historyMarkerMap = await loadMarkerMap('pond_history')
+    const historyRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of historyMarkerMap.entries()) {
+      historyRemoteToLocal.set(remoteId, localId)
+    }
+
+    for (const row of history) {
+      const remoteId = safeText(row.id).trim()
+      if (!remoteId) continue
+
+      const localId = historyRemoteToLocal.get(remoteId) || remoteId
+      if (pendingRecords.has(`pond_history:${localId}`)) {
+        markerWrites.push({ entity: 'pond_history', localId, remoteId })
+        continue
+      }
+
+      const existing = historyById.get(localId)
+      const dirtyRaw = makeSyncedDirtyRaw(localId, {
+        pond_id: mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps),
+        event_type: row.event_type || row.eventType || '',
+        event_data:
+          typeof row.event_data === 'string'
+            ? row.event_data
+            : JSON.stringify(row.event_data || row.eventData || {}),
+        created_at: toTimestamp(row.created_at || row.createdAt),
+        recorded_by: String(row.recorded_by || row.recordedBy || ''),
+      })
+
+      const prepared = await prepareWatermelonUpsert(historyCollection, existing, dirtyRaw)
+      if (prepared) {
+        operations.push(prepared)
+      }
+
+      historyById.set(localId, existing || { id: localId })
+      markerWrites.push({ entity: 'pond_history', localId, remoteId })
+    }
+
+    if (operations.length > 0) {
+      await database.write(async () => {
+        await (database as any).batch(...operations)
+      })
+    }
+
+    await setMarkers(markerWrites)
+
+    metrics.pulled.ponds += ponds.length
+    metrics.pulled.mortality_logs += mortalities.length
+    metrics.pulled.harvests += harvests.length
+    metrics.pulled.stocking_logs += stockings.length
+    metrics.pulled.pond_history += history.length
+
+    await setLastPullAt(Date.now())
+
+    console.log(
+      `✅ Pulled ${ponds.length} ponds, ${mortalities.length} mortality logs, ${harvests.length} harvests, ${stockings.length} stockings, ${history.length} history records`
+    )
+  })
 }
 
 async function recoverStandalonePullCacheFromDuplicate(metrics: SyncMetrics): Promise<void> {
@@ -1785,167 +1826,175 @@ async function syncSupabaseToMock(
     pullSupabaseTableSince('pond_history', sinceIso, userId, scopeToUser),
   ])
 
-  const pondMaps = await loadPondIdMaps()
+  return withLocalMutation(async () => {
+    const pendingRecords = new Set((await loadSyncQueue())
+      .filter(item => item.status !== 'synced')
+      .map(item => `${item.entity}:${item.localId}`))
+    const pondMaps = await loadPondIdMaps()
+    const markerWrites: Array<{ entity: SyncEntity; localId: string; remoteId: string }> = []
 
-  if (scopeToUser) {
-    const removed = await removeOutOfScopeMockRecords(userId)
-    metrics.skipped += removed
-  }
+    if (scopeToUser) {
+      const removed = await removeOutOfScopeMockRecords(userId)
+      metrics.skipped += removed
+    }
 
-  const localPonds = await mockDatabase.getAll('pond:')
-  const localPondBySignature = new Map<string, any>()
-  for (const pond of localPonds) {
-    const signature = pondSyncSignature(
-      pond.name,
-      pond.createdBy || pond.created_by,
-      pond.createdAt || pond.created_at
+    const localPonds = await mockDatabase.getAll('pond:')
+    const localPondBySignature = new Map<string, any>()
+    for (const pond of localPonds) {
+      const signature = pondSyncSignature(
+        pond.name,
+        pond.createdBy || pond.created_by,
+        pond.createdAt || pond.created_at
+      )
+      localPondBySignature.set(signature, pond)
+    }
+
+    for (const row of ponds) {
+      const signature = pondSyncSignature(row.name, row.created_by || row.createdBy, row.created_at || row.createdAt)
+      const matchedLocal = localPondBySignature.get(signature)
+      const localId = safeText(matchedLocal?.id || row.id)
+
+      if (!pendingRecords.has(`ponds:${localId}`)) await mockDatabase.set(`pond:${localId}`, {
+        id: localId,
+        name: row.name || 'Unnamed Pond',
+        location: normalizeLocation(row.location),
+        boundary: row.boundary || undefined,
+        createdBy: row.created_by || row.createdBy || '',
+        createdAt: toTimestamp(row.created_at || row.createdAt),
+        isActive: Boolean(row.is_active ?? row.isActive),
+        currentSpecies: row.current_species ?? row.currentSpecies ?? undefined,
+        currentStockCount: Number(row.current_stock_count ?? row.currentStockCount ?? 0),
+      })
+
+      if (row.id) {
+        pondMaps.localToRemote.set(localId, String(row.id))
+        pondMaps.remoteToLocal.set(String(row.id), localId)
+        markerWrites.push({ entity: 'ponds', localId, remoteId: String(row.id) })
+      }
+    }
+
+    const mortalityMarkerMap = await loadMarkerMap('mortality_logs')
+    const mortalityRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of mortalityMarkerMap.entries()) {
+      mortalityRemoteToLocal.set(remoteId, localId)
+    }
+
+    for (const row of mortalities) {
+      const remoteId = safeText(row.id)
+      const localId = mortalityRemoteToLocal.get(remoteId) || remoteId
+      const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
+
+      if (!pendingRecords.has(`mortality_logs:${localId}`)) await mockDatabase.set(`mortality:${localId}`, {
+        id: localId,
+        pondId,
+        quantity: Number(row.quantity || 0),
+        notes: row.notes || undefined,
+        loggedBy: String(row.logged_by || row.loggedBy || ''),
+        createdAt: toTimestamp(row.created_at || row.createdAt),
+      })
+
+      if (remoteId) {
+        markerWrites.push({ entity: 'mortality_logs', localId, remoteId: remoteId })
+      }
+    }
+
+    const harvestMarkerMap = await loadMarkerMap('harvests')
+    const harvestRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of harvestMarkerMap.entries()) {
+      harvestRemoteToLocal.set(remoteId, localId)
+    }
+
+    for (const row of harvests) {
+      const remoteId = safeText(row.id)
+      const localId = harvestRemoteToLocal.get(remoteId) || remoteId
+      const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
+
+      if (!pendingRecords.has(`harvests:${localId}`)) await mockDatabase.set(`harvest:${localId}`, {
+        id: localId,
+        pondId,
+        yieldKg: Number(row.yield_kg ?? row.yieldKg ?? 0),
+        harvestedBy: String(row.harvested_by || row.harvestedBy || ''),
+        createdAt: toTimestamp(row.created_at || row.createdAt),
+        species: row.species || undefined,
+        isPartial: Boolean(row.is_partial ?? row.isPartial),
+        fishCount: row.fish_count ?? row.fishCount ?? undefined,
+      })
+
+      if (remoteId) {
+        markerWrites.push({ entity: 'harvests', localId, remoteId: remoteId })
+      }
+    }
+
+    const stockingMarkerMap = await loadMarkerMap('stocking_logs')
+    const stockingRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of stockingMarkerMap.entries()) {
+      stockingRemoteToLocal.set(remoteId, localId)
+    }
+
+    for (const row of stockings) {
+      const remoteId = safeText(row.id)
+      const localId = stockingRemoteToLocal.get(remoteId) || remoteId
+      const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
+
+      if (!pendingRecords.has(`stocking_logs:${localId}`)) await mockDatabase.set(`stocking:${localId}`, {
+        id: localId,
+        pondId,
+        species: row.species || '',
+        quantity: Number(row.quantity || 0),
+        averageWeightG: row.average_weight_g ?? row.averageWeightG ?? undefined,
+        source: row.source || undefined,
+        stockedBy: String(row.stocked_by || row.stockedBy || ''),
+        createdAt: toTimestamp(row.created_at || row.createdAt),
+        status: row.status || 'active',
+      })
+
+      if (remoteId) {
+        markerWrites.push({ entity: 'stocking_logs', localId, remoteId: remoteId })
+      }
+    }
+
+    const historyMarkerMap = await loadMarkerMap('pond_history')
+    const historyRemoteToLocal = new Map<string, string>()
+    for (const [localId, remoteId] of historyMarkerMap.entries()) {
+      historyRemoteToLocal.set(remoteId, localId)
+    }
+
+    for (const row of history) {
+      const remoteId = safeText(row.id)
+      const localId = historyRemoteToLocal.get(remoteId) || remoteId
+      const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
+
+      if (!pendingRecords.has(`pond_history:${localId}`)) await mockDatabase.set(`history:${localId}`, {
+        id: localId,
+        pondId,
+        eventType: row.event_type || row.eventType || '',
+        eventData:
+          typeof row.event_data === 'string'
+            ? row.event_data
+            : JSON.stringify(row.event_data || row.eventData || {}),
+        createdAt: toTimestamp(row.created_at || row.createdAt),
+        recordedBy: String(row.recorded_by || row.recordedBy || ''),
+      })
+
+      if (remoteId) {
+        markerWrites.push({ entity: 'pond_history', localId, remoteId: remoteId })
+      }
+    }
+
+    await setMarkers(markerWrites)
+
+    metrics.pulled.ponds += ponds.length
+    metrics.pulled.mortality_logs += mortalities.length
+    metrics.pulled.harvests += harvests.length
+    metrics.pulled.stocking_logs += stockings.length
+    metrics.pulled.pond_history += history.length
+
+    await setLastPullAt(Date.now())
+
+    console.log(
+      `✅ Pulled ${ponds.length} ponds, ${mortalities.length} mortality logs, ${harvests.length} harvests, ${stockings.length} stockings, ${history.length} history records`
     )
-    localPondBySignature.set(signature, pond)
-  }
-
-  for (const row of ponds) {
-    const signature = pondSyncSignature(row.name, row.created_by || row.createdBy, row.created_at || row.createdAt)
-    const matchedLocal = localPondBySignature.get(signature)
-    const localId = safeText(matchedLocal?.id || row.id)
-
-    await mockDatabase.set(`pond:${localId}`, {
-      id: localId,
-      name: row.name || 'Unnamed Pond',
-      location: normalizeLocation(row.location),
-      boundary: row.boundary || undefined,
-      createdBy: row.created_by || row.createdBy || '',
-      createdAt: toTimestamp(row.created_at || row.createdAt),
-      isActive: Boolean(row.is_active ?? row.isActive),
-      currentSpecies: row.current_species ?? row.currentSpecies ?? undefined,
-      currentStockCount: Number(row.current_stock_count ?? row.currentStockCount ?? 0) || undefined,
-    })
-
-    if (row.id) {
-      pondMaps.localToRemote.set(localId, String(row.id))
-      pondMaps.remoteToLocal.set(String(row.id), localId)
-      await setMarker('ponds', localId, String(row.id))
-    }
-  }
-
-  const mortalityMarkerMap = await loadMarkerMap('mortality_logs')
-  const mortalityRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of mortalityMarkerMap.entries()) {
-    mortalityRemoteToLocal.set(remoteId, localId)
-  }
-
-  for (const row of mortalities) {
-    const remoteId = safeText(row.id)
-    const localId = mortalityRemoteToLocal.get(remoteId) || remoteId
-    const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
-
-    await mockDatabase.set(`mortality:${localId}`, {
-      id: localId,
-      pondId,
-      quantity: Number(row.quantity || 0),
-      notes: row.notes || undefined,
-      loggedBy: String(row.logged_by || row.loggedBy || ''),
-      createdAt: toTimestamp(row.created_at || row.createdAt),
-    })
-
-    if (remoteId) {
-      await setMarker('mortality_logs', localId, remoteId)
-    }
-  }
-
-  const harvestMarkerMap = await loadMarkerMap('harvests')
-  const harvestRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of harvestMarkerMap.entries()) {
-    harvestRemoteToLocal.set(remoteId, localId)
-  }
-
-  for (const row of harvests) {
-    const remoteId = safeText(row.id)
-    const localId = harvestRemoteToLocal.get(remoteId) || remoteId
-    const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
-
-    await mockDatabase.set(`harvest:${localId}`, {
-      id: localId,
-      pondId,
-      yieldKg: Number(row.yield_kg ?? row.yieldKg ?? 0),
-      harvestedBy: String(row.harvested_by || row.harvestedBy || ''),
-      createdAt: toTimestamp(row.created_at || row.createdAt),
-      species: row.species || undefined,
-      isPartial: Boolean(row.is_partial ?? row.isPartial),
-      fishCount: row.fish_count ?? row.fishCount ?? undefined,
-    })
-
-    if (remoteId) {
-      await setMarker('harvests', localId, remoteId)
-    }
-  }
-
-  const stockingMarkerMap = await loadMarkerMap('stocking_logs')
-  const stockingRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of stockingMarkerMap.entries()) {
-    stockingRemoteToLocal.set(remoteId, localId)
-  }
-
-  for (const row of stockings) {
-    const remoteId = safeText(row.id)
-    const localId = stockingRemoteToLocal.get(remoteId) || remoteId
-    const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
-
-    await mockDatabase.set(`stocking:${localId}`, {
-      id: localId,
-      pondId,
-      species: row.species || '',
-      quantity: Number(row.quantity || 0),
-      averageWeightG: row.average_weight_g ?? row.averageWeightG ?? undefined,
-      source: row.source || undefined,
-      stockedBy: String(row.stocked_by || row.stockedBy || ''),
-      createdAt: toTimestamp(row.created_at || row.createdAt),
-      status: row.status || 'active',
-    })
-
-    if (remoteId) {
-      await setMarker('stocking_logs', localId, remoteId)
-    }
-  }
-
-  const historyMarkerMap = await loadMarkerMap('pond_history')
-  const historyRemoteToLocal = new Map<string, string>()
-  for (const [localId, remoteId] of historyMarkerMap.entries()) {
-    historyRemoteToLocal.set(remoteId, localId)
-  }
-
-  for (const row of history) {
-    const remoteId = safeText(row.id)
-    const localId = historyRemoteToLocal.get(remoteId) || remoteId
-    const pondId = mapRemotePondIdToLocal(safeText(row.pond_id || row.pondId || ''), pondMaps)
-
-    await mockDatabase.set(`history:${localId}`, {
-      id: localId,
-      pondId,
-      eventType: row.event_type || row.eventType || '',
-      eventData:
-        typeof row.event_data === 'string'
-          ? row.event_data
-          : JSON.stringify(row.event_data || row.eventData || {}),
-      createdAt: toTimestamp(row.created_at || row.createdAt),
-      recordedBy: String(row.recorded_by || row.recordedBy || ''),
-    })
-
-    if (remoteId) {
-      await setMarker('pond_history', localId, remoteId)
-    }
-  }
-
-  metrics.pulled.ponds += ponds.length
-  metrics.pulled.mortality_logs += mortalities.length
-  metrics.pulled.harvests += harvests.length
-  metrics.pulled.stocking_logs += stockings.length
-  metrics.pulled.pond_history += history.length
-
-  await setLastPullAt(Date.now())
-
-  console.log(
-    `✅ Pulled ${ponds.length} ponds, ${mortalities.length} mortality logs, ${harvests.length} harvests, ${stockings.length} stockings, ${history.length} history records`
-  )
+  })
 }
 
 async function syncWatermelonDb(options: SyncDataOptions, metrics: SyncMetrics): Promise<void> {
@@ -2233,11 +2282,16 @@ export async function syncData(options: SyncDataOptions = {}): Promise<SyncMetri
         throw normalized
       }
 
-      await recoverStandalonePullCacheFromDuplicate(metrics)
+      await withLocalMutation(async () => {
+        // A user may have saved while this pull was in flight. Never reset a
+        // cache that now contains pending transactions to recover a duplicate.
+        if ((await getSyncQueueSnapshot(1)).pending > 0) throw normalized
+        await recoverStandalonePullCacheFromDuplicate(metrics)
+      })
       await syncSupabaseToWatermelon(metrics, preflight.userId, scopeToUser)
     }
 
-    await recomputeAllPondStates()
+    await withLocalMutation(() => recomputeAllPondStates())
 
     await removeSyncedQueueItems(15_000)
     const snapshot = await getSyncQueueSnapshot(200)

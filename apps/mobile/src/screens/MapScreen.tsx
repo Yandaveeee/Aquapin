@@ -19,7 +19,7 @@ import { useRoute, useNavigation } from '@react-navigation/native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import MapView, { Marker, Region, MapPressEvent, MapType, Polygon, Polyline, UrlTile, PROVIDER_GOOGLE, PROVIDER_DEFAULT } from 'react-native-maps';
 import * as Location from 'expo-location';
-import { Ionicons } from '@expo/vector-icons';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import { usePonds, useCreatePond } from '../hooks/useOfflineData';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
